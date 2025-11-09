@@ -50,6 +50,249 @@ class STL10DatasetLoader:
         """
         return self.default_transform
     
+    @staticmethod
+    def get_vit_train_transform(
+        image_size: int = 224,
+        mean: Optional[list] = None,
+        std: Optional[list] = None,
+        use_augmentation: bool = True
+    ) -> transforms.Compose:
+        """
+        Get ViT-specific training transforms with data augmentation.
+        
+        Args:
+            image_size: Target image size (default 224x224 for ViT).
+            mean: Normalization mean values. If None, uses ImageNet statistics.
+            std: Normalization std values. If None, uses ImageNet statistics.
+            use_augmentation: If True, applies data augmentation.
+        
+        Returns:
+            Transform composition for training.
+        """
+        if mean is None:
+            mean = STL10DatasetLoader.DEFAULT_MEAN
+        if std is None:
+            std = STL10DatasetLoader.DEFAULT_STD
+        
+        if use_augmentation:
+            transform = transforms.Compose([
+                transforms.RandomResizedCrop(
+                    image_size,
+                    scale=(0.8, 1.0),
+                    ratio=(0.9, 1.1)
+                ),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(
+                    brightness=0.2,
+                    contrast=0.2,
+                    saturation=0.2,
+                    hue=0.1
+                ),
+                transforms.RandomRotation(degrees=10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+                transforms.RandomErasing(p=0.1, scale=(0.02, 0.33))
+            ])
+        else:
+            transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)
+            ])
+        
+        return transform
+    
+    @staticmethod
+    def get_vit_val_transform(
+        image_size: int = 224,
+        mean: Optional[list] = None,
+        std: Optional[list] = None
+    ) -> transforms.Compose:
+        """
+        Get ViT-specific validation/test transforms (no augmentation).
+        
+        Args:
+            image_size: Target image size (default 224x224 for ViT).
+            mean: Normalization mean values. If None, uses ImageNet statistics.
+            std: Normalization std values. If None, uses ImageNet statistics.
+        
+        Returns:
+            Transform composition for validation/test.
+        """
+        if mean is None:
+            mean = STL10DatasetLoader.DEFAULT_MEAN
+        if std is None:
+            std = STL10DatasetLoader.DEFAULT_STD
+        
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+        
+        return transform
+    
+    @staticmethod
+    def get_contrastive_transform(
+        image_size: int = 224,
+        mean: Optional[list] = None,
+        std: Optional[list] = None,
+        use_strong_augmentation: bool = True
+    ) -> transforms.Compose:
+        """
+        Get strong augmentation transforms for contrastive learning.
+        
+        This transform is designed for self-supervised contrastive learning
+        (SimCLR, MoCo, etc.) and includes strong augmentations like:
+        - RandomResizedCrop
+        - RandomHorizontalFlip
+        - ColorJitter
+        - GaussianBlur
+        - RandomSolarize
+        
+        Args:
+            image_size: Target image size (default 224x224).
+            mean: Normalization mean values. If None, uses ImageNet statistics.
+            std: Normalization std values. If None, uses ImageNet statistics.
+            use_strong_augmentation: If True, applies strong augmentation.
+        
+        Returns:
+            Transform composition for contrastive learning.
+        """
+        if mean is None:
+            mean = STL10DatasetLoader.DEFAULT_MEAN
+        if std is None:
+            std = STL10DatasetLoader.DEFAULT_STD
+        
+        if use_strong_augmentation:
+            transform = transforms.Compose([
+                transforms.RandomResizedCrop(
+                    image_size,
+                    scale=(0.2, 1.0),  # Stronger crop range for contrastive learning
+                    ratio=(0.75, 1.33)
+                ),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomApply([
+                    transforms.ColorJitter(
+                        brightness=0.4,
+                        contrast=0.4,
+                        saturation=0.4,
+                        hue=0.1
+                    )
+                ], p=0.8),
+                transforms.RandomApply([
+                    transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))
+                ], p=0.5),
+                transforms.RandomApply([
+                    transforms.RandomSolarize(threshold=128, p=1.0)
+                ], p=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.33))
+            ])
+        else:
+            # Minimal augmentation for validation/evaluation
+            transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)
+            ])
+        
+        return transform
+    
+    def get_contrastive_data_loader(
+        self,
+        batch_size: int = 256,
+        num_workers: int = 4,
+        image_size: int = 224,
+        use_strong_augmentation: bool = True,
+        download: Optional[bool] = None,
+        shuffle: bool = True,
+        pin_memory: bool = True,
+        split: str = "unlabeled"
+    ) -> torch.utils.data.DataLoader:
+        """
+        Get data loader for contrastive learning (typically uses unlabeled data).
+        
+        Args:
+            batch_size: Batch size (typically large for contrastive learning, e.g., 256).
+            num_workers: Number of worker processes for data loading.
+            image_size: Target image size (default 224x224).
+            use_strong_augmentation: If True, applies strong augmentation.
+            download: If True, downloads the dataset from the internet. If None, uses instance default.
+            shuffle: If True, shuffles data.
+            pin_memory: If True, pins memory for faster GPU transfer.
+            split: Dataset split to use ('unlabeled', 'train', 'train+unlabeled').
+        
+        Returns:
+            DataLoader for contrastive learning.
+        """
+        # Get contrastive transform
+        transform = self.get_contrastive_transform(
+            image_size=image_size,
+            use_strong_augmentation=use_strong_augmentation
+        )
+        
+        # Load dataset
+        if split == "unlabeled":
+            dataset = self.get_unlabeled_dataset(transform=transform, download=download)
+        else:
+            dataset = self.get_dataset(split=split, transform=transform, download=download)
+        
+        # Create data loader
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=True  # Important for contrastive learning to have consistent batch sizes
+        )
+        
+        return loader
+    
+    def get_vit_data_loaders(
+        self,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        image_size: int = 224,
+        use_augmentation: bool = True,
+        download: Optional[bool] = None,
+        shuffle_train: bool = True,
+        pin_memory: bool = True,
+    ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+        """
+        Get STL-10 data loaders with ViT-specific transforms.
+        
+        Args:
+            batch_size: Batch size for data loaders.
+            num_workers: Number of worker processes for data loading.
+            image_size: Target image size (default 224x224 for ViT).
+            use_augmentation: If True, applies data augmentation to training data.
+            download: If True, downloads the dataset from the internet. If None, uses instance default.
+            shuffle_train: If True, shuffles training data.
+            pin_memory: If True, pins memory for faster GPU transfer.
+        
+        Returns:
+            Tuple of (train_loader, test_loader).
+        """
+        # Get ViT-specific transforms
+        train_transform = self.get_vit_train_transform(
+            image_size=image_size,
+            use_augmentation=use_augmentation
+        )
+        test_transform = self.get_vit_val_transform(image_size=image_size)
+        
+        return self.get_data_loaders(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            train_transform=train_transform,
+            test_transform=test_transform,
+            download=download,
+            shuffle_train=shuffle_train,
+            pin_memory=pin_memory
+        )
+    
     def get_dataset(
         self,
         split: str = "train",
