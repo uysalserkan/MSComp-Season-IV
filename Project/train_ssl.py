@@ -32,9 +32,16 @@ from utils import (
 try:
     from lightly.loss import NTXentLoss
     from lightly.data import SimCLRCollateFunction
+    # Try importing SimCLRTransform as well in case we need it
+    try:
+        from lightly.transforms import SimCLRTransform
+        SIMCLR_TRANSFORM_AVAILABLE = True
+    except ImportError:
+        SIMCLR_TRANSFORM_AVAILABLE = False
     LIGHTLY_AVAILABLE = True
 except ImportError:
     LIGHTLY_AVAILABLE = False
+    SIMCLR_TRANSFORM_AVAILABLE = False
     print("Warning: lightly library not available. Using custom NT-Xent loss.")
 
 
@@ -129,8 +136,6 @@ class SSLTrainer:
         param_counts = count_parameters(self.model)
         print(f"Total parameters: {param_counts['total']:,}")
         print(f"Trainable parameters: {param_counts['trainable']:,}")
-        print(f"Backbone parameters: {param_counts['backbone']:,}")
-        print(f"Projection parameters: {param_counts['projection']:,}")
         print(f"Method: {config.method.upper()}")
         print("="*50 + "\n")
         
@@ -147,6 +152,7 @@ class SSLTrainer:
         )
         
         # Create collate function for two-view augmentation
+        use_lightly_collate = False
         if LIGHTLY_AVAILABLE:
             # SimCLRCollateFunction expects PIL images, so load dataset WITHOUT transforms
             unlabeled_dataset = self.dataset_loader.get_unlabeled_dataset(
@@ -154,31 +160,69 @@ class SSLTrainer:
                 download=True
             )
             
-            collate_fn = SimCLRCollateFunction(
-                input_size=config.image_size,
-                cj_prob=0.8,
-                cj_bright=0.4,
-                cj_contrast=0.4,
-                cj_sat=0.4,
-                cj_hue=0.1,
-                min_scale=0.2,
-                random_gray_scale=0.2,
-                gaussian_blur=0.5,
-                kernel_size=23,
-                sigmas=(0.1, 2.0),
-                solarize_prob=0.2,
-                normalize={
-                    'mean': [0.485, 0.456, 0.406],
-                    'std': [0.229, 0.224, 0.225]
-                }
-            )
-        else:
+            # Try to use SimCLRCollateFunction with correct API
+            # Different versions of lightly may have different APIs
+            try:
+                # Try with basic parameters first (most compatible)
+                collate_fn = SimCLRCollateFunction(
+                    input_size=config.image_size,
+                    cj_prob=0.8,
+                    min_scale=0.2,
+                    random_gray_scale=0.2,
+                    gaussian_blur=0.5,
+                    normalize={
+                        'mean': [0.485, 0.456, 0.406],
+                        'std': [0.229, 0.224, 0.225]
+                    }
+                )
+                use_lightly_collate = True
+            except TypeError as e:
+                # If that fails, try with even fewer parameters
+                try:
+                    collate_fn = SimCLRCollateFunction(
+                        input_size=config.image_size,
+                        normalize={
+                            'mean': [0.485, 0.456, 0.406],
+                            'std': [0.229, 0.224, 0.225]
+                        }
+                    )
+                    use_lightly_collate = True
+                except TypeError:
+                    # Use SimCLRTransform if available, otherwise fall back to custom
+                    if SIMCLR_TRANSFORM_AVAILABLE:
+                        transform = SimCLRTransform(
+                            input_size=config.image_size,
+                            cj_prob=0.8,
+                            cj_strength=0.5,
+                            min_scale=0.2,
+                            random_gray_scale=0.2,
+                            gaussian_blur=0.5,
+                            normalize={
+                                'mean': [0.485, 0.456, 0.406],
+                                'std': [0.229, 0.224, 0.225]
+                            }
+                        )
+                        # Create a simple collate that applies transform twice
+                        def collate_fn(batch):
+                            images = [item[0] for item in batch]
+                            view0 = torch.stack([transform(img) for img in images])
+                            view1 = torch.stack([transform(img) for img in images])
+                            return view0, view1
+                        use_lightly_collate = False  # Not using lightly collate, but using lightly transform
+                    else:
+                        # Fall back to custom implementation
+                        print(f"Warning: SimCLRCollateFunction API not compatible: {e}")
+                        print("Falling back to custom collate function.")
+                        use_lightly_collate = False
+        
+        if not use_lightly_collate:
             # For custom collate, load dataset WITHOUT transforms (PIL images)
             # We'll apply transforms in the collate function to get two different views
-            unlabeled_dataset = self.dataset_loader.get_unlabeled_dataset(
-                transform=None,  # No transform - we'll apply in collate function
-                download=True
-            )
+            if not LIGHTLY_AVAILABLE:
+                unlabeled_dataset = self.dataset_loader.get_unlabeled_dataset(
+                    transform=None,  # No transform - we'll apply in collate function
+                    download=True
+                )
             
             # Custom collate function that creates two different augmented views
             # We need to apply the transform twice with different random states
