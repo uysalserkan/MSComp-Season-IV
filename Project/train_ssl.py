@@ -385,30 +385,64 @@ class SSLTrainer:
         for batch_idx, batch in enumerate(pbar):
             # Get two augmented views from collate function
             # SimCLRCollateFunction returns (views, labels, filenames) where views is a list
-            if LIGHTLY_AVAILABLE and isinstance(batch, tuple) and len(batch) >= 2:
-                # Lightly format: (views, labels, filenames) or (views, labels)
-                views = batch[0]
-                if isinstance(views, (list, tuple)) and len(views) >= 2:
-                    # views is a list/tuple of tensors, one for each view
-                    view0 = views[0].to(self.device)
-                    view1 = views[1].to(self.device)
-                else:
-                    raise ValueError(f"Unexpected views format from lightly: {type(views)}, expected list/tuple with 2+ views")
-            elif isinstance(batch, tuple) and len(batch) == 2:
-                # Custom collate format: (view0, view1)
-                view0, view1 = batch
-                view0 = view0.to(self.device)
-                view1 = view1.to(self.device)
-            else:
-                # Fallback: create two views from single batch
-                if isinstance(batch, torch.Tensor):
+            try:
+                if LIGHTLY_AVAILABLE and isinstance(batch, tuple) and len(batch) >= 2:
+                    # Lightly format: (views, labels, filenames) or (views, labels)
+                    views = batch[0]
+                    if isinstance(views, (list, tuple)) and len(views) >= 2:
+                        # views is a list/tuple of tensors, one for each view
+                        view0 = views[0].to(self.device)
+                        view1 = views[1].to(self.device)
+                    else:
+                        raise ValueError(f"Unexpected views format from lightly: {type(views)}, expected list/tuple with 2+ views")
+                elif isinstance(batch, tuple) and len(batch) == 2:
+                    # Custom collate format: (view0, view1)
+                    view0, view1 = batch
+                    # Ensure they are tensors
+                    if isinstance(view0, torch.Tensor):
+                        view0 = view0.to(self.device)
+                    else:
+                        view0 = torch.stack(view0) if isinstance(view0, (list, tuple)) else torch.tensor(view0).to(self.device)
+                    
+                    if isinstance(view1, torch.Tensor):
+                        view1 = view1.to(self.device)
+                    else:
+                        view1 = torch.stack(view1) if isinstance(view1, (list, tuple)) else torch.tensor(view1).to(self.device)
+                elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    # Batch might be a list/tuple of two views directly
+                    view0_raw = batch[0]
+                    view1_raw = batch[1]
+                    # Convert to tensors if needed
+                    if isinstance(view0_raw, torch.Tensor):
+                        view0 = view0_raw.to(self.device)
+                    elif isinstance(view0_raw, (list, tuple)):
+                        view0 = torch.stack([img.to(self.device) if isinstance(img, torch.Tensor) else torch.tensor(img).to(self.device) for img in view0_raw])
+                    else:
+                        view0 = torch.tensor(view0_raw).to(self.device)
+                    
+                    if isinstance(view1_raw, torch.Tensor):
+                        view1 = view1_raw.to(self.device)
+                    elif isinstance(view1_raw, (list, tuple)):
+                        view1 = torch.stack([img.to(self.device) if isinstance(img, torch.Tensor) else torch.tensor(img).to(self.device) for img in view1_raw])
+                    else:
+                        view1 = torch.tensor(view1_raw).to(self.device)
+                elif isinstance(batch, torch.Tensor):
+                    # Single tensor batch - create two views
                     images = batch.to(self.device)
-                elif isinstance(batch, (list, tuple)) and len(batch) > 0:
-                    images = batch[0].to(self.device)
+                    view0 = images
+                    view1 = images.clone()
                 else:
-                    raise ValueError(f"Unexpected batch format: {type(batch)}")
-                view0 = images
-                view1 = images.clone()
+                    raise ValueError(f"Unexpected batch format: {type(batch)}, batch length: {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+            except Exception as e:
+                print(f"\nError processing batch at index {batch_idx}: {e}")
+                print(f"Batch type: {type(batch)}")
+                if isinstance(batch, (list, tuple)):
+                    print(f"Batch length: {len(batch)}")
+                    if len(batch) > 0:
+                        print(f"First element type: {type(batch[0])}")
+                        if isinstance(batch[0], (list, tuple)):
+                            print(f"First element length: {len(batch[0])}")
+                raise
             
             # Forward pass with mixed precision
             if self.config.mixed_precision:
