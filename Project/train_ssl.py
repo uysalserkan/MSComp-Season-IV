@@ -386,11 +386,16 @@ class SSLTrainer:
             # Get two augmented views from collate function
             # SimCLRCollateFunction returns (views, labels, filenames) where views is a list
             try:
-                if LIGHTLY_AVAILABLE and isinstance(batch, tuple) and len(batch) >= 2:
-                    # Lightly format: (views, labels, filenames) or (views, labels)
-                    views = batch[0]
-                    if isinstance(views, (list, tuple)) and len(views) >= 2:
+                view0 = None
+                view1 = None
+                
+                # Check for lightly batch format: [views, labels, filenames] where views is a list
+                if LIGHTLY_AVAILABLE and isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    # Check if first element is a list/tuple (views list from lightly)
+                    if isinstance(batch[0], (list, tuple)) and len(batch[0]) >= 2:
+                        # Lightly format: [views, labels, filenames] or (views, labels, filenames)
                         # views is a list/tuple of tensors, one for each view
+                        views = batch[0]
                         view0 = views[0].to(self.device)
                         view1 = views[1].to(self.device)
                         # Validate shapes
@@ -398,21 +403,24 @@ class SSLTrainer:
                             raise ValueError(f"view0 from lightly has wrong dimensions: {view0.dim()}, expected 4. Shape: {view0.shape}")
                         if view1.dim() != 4:
                             raise ValueError(f"view1 from lightly has wrong dimensions: {view1.dim()}, expected 4. Shape: {view1.shape}")
-                    else:
-                        raise ValueError(f"Unexpected views format from lightly: {type(views)}, expected list/tuple with 2+ views")
-                elif isinstance(batch, tuple) and len(batch) == 2:
-                    # Custom collate format: (view0, view1)
-                    view0, view1 = batch
+                
+                # If not handled as lightly batch, try other formats
+                if view0 is None or view1 is None:
+                    if isinstance(batch, (tuple, list)) and len(batch) == 2:
+                        # Custom collate format: (view0, view1) or [view0, view1]
+                        view0, view1 = batch[0], batch[1]
+                    
                     # Ensure they are tensors with correct shape
-                    if isinstance(view0, torch.Tensor):
-                        if view0.dim() == 4:
-                            view0 = view0.to(self.device)
-                        else:
-                            # If it's a single image (3D), we need to add batch dimension
-                            if view0.dim() == 3:
-                                view0 = view0.unsqueeze(0).to(self.device)
+                    if view0 is not None and view1 is not None:
+                        if isinstance(view0, torch.Tensor):
+                            if view0.dim() == 4:
+                                view0 = view0.to(self.device)
                             else:
-                                raise ValueError(f"view0 has unexpected dimensions: {view0.dim()}, shape: {view0.shape}")
+                                # If it's a single image (3D), we need to add batch dimension
+                                if view0.dim() == 3:
+                                    view0 = view0.unsqueeze(0).to(self.device)
+                                else:
+                                    raise ValueError(f"view0 has unexpected dimensions: {view0.dim()}, shape: {view0.shape}")
                     elif isinstance(view0, (list, tuple)):
                         # Stack list of tensors
                         if len(view0) > 0 and isinstance(view0[0], torch.Tensor):
@@ -443,8 +451,8 @@ class SSLTrainer:
                         view1 = torch.tensor(view1).to(self.device)
                         if view1.dim() == 3:
                             view1 = view1.unsqueeze(0)
-                elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                    # Batch might be a list/tuple of two views directly
+                elif isinstance(batch, (list, tuple)) and len(batch) == 2:
+                    # Batch might be a list/tuple of two views directly (custom collate)
                     view0_raw = batch[0]
                     view1_raw = batch[1]
                     # Convert to tensors if needed
@@ -489,13 +497,49 @@ class SSLTrainer:
                         view1 = torch.tensor(view1_raw).to(self.device)
                         if view1.dim() == 3:
                             view1 = view1.unsqueeze(0)
-                elif isinstance(batch, torch.Tensor):
-                    # Single tensor batch - create two views
-                    images = batch.to(self.device)
-                    view0 = images
-                    view1 = images.clone()
-                else:
-                    raise ValueError(f"Unexpected batch format: {type(batch)}, batch length: {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+                    # Ensure they are tensors with correct shape
+                    if view0 is not None and view1 is not None:
+                        if isinstance(view0, torch.Tensor):
+                            if view0.dim() == 4:
+                                view0 = view0.to(self.device)
+                            else:
+                                # If it's a single image (3D), we need to add batch dimension
+                                if view0.dim() == 3:
+                                    view0 = view0.unsqueeze(0).to(self.device)
+                                else:
+                                    raise ValueError(f"view0 has unexpected dimensions: {view0.dim()}, shape: {view0.shape}")
+                        elif isinstance(view0, (list, tuple)):
+                            # Stack list of tensors
+                            if len(view0) > 0 and isinstance(view0[0], torch.Tensor):
+                                view0 = torch.stack(view0).to(self.device)
+                            else:
+                                view0 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view0])
+                        else:
+                            view0 = torch.tensor(view0).to(self.device)
+                            if view0.dim() == 3:
+                                view0 = view0.unsqueeze(0)
+                        
+                        if isinstance(view1, torch.Tensor):
+                            if view1.dim() == 4:
+                                view1 = view1.to(self.device)
+                            else:
+                                # If it's a single image (3D), we need to add batch dimension
+                                if view1.dim() == 3:
+                                    view1 = view1.unsqueeze(0).to(self.device)
+                                else:
+                                    raise ValueError(f"view1 has unexpected dimensions: {view1.dim()}, shape: {view1.shape}")
+                        elif isinstance(view1, (list, tuple)):
+                            # Stack list of tensors
+                            if len(view1) > 0 and isinstance(view1[0], torch.Tensor):
+                                view1 = torch.stack(view1).to(self.device)
+                            else:
+                                view1 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view1])
+                        else:
+                            view1 = torch.tensor(view1).to(self.device)
+                            if view1.dim() == 3:
+                                view1 = view1.unsqueeze(0)
+                    else:
+                        raise ValueError(f"Could not extract views from batch. Batch type: {type(batch)}, length: {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
             except Exception as e:
                 print(f"\nError processing batch at index {batch_idx}: {e}")
                 print(f"Batch type: {type(batch)}")
@@ -505,6 +549,10 @@ class SSLTrainer:
                         print(f"First element type: {type(batch[0])}")
                         if isinstance(batch[0], (list, tuple)):
                             print(f"First element length: {len(batch[0])}")
+                            if len(batch[0]) > 0:
+                                print(f"First element[0] type: {type(batch[0][0])}")
+                                if isinstance(batch[0][0], torch.Tensor):
+                                    print(f"First element[0] shape: {batch[0][0].shape}")
                 raise
             
             # Forward pass with mixed precision
