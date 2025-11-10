@@ -569,9 +569,9 @@ class SSLTrainer:
                     
                     # Compute contrastive loss
                     if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                        # Lightly NTXentLoss expects a list of views: [view0, view1]
+                        # Lightly NTXentLoss expects two separate arguments: out0, out1
                         # Each view should be (batch_size, projection_dim)
-                        loss = self.criterion([z0, z1])
+                        loss = self.criterion(z0, z1)
                     else:
                         # Custom loss expects two separate tensors
                         loss = self.criterion(z0, z1)
@@ -582,8 +582,8 @@ class SSLTrainer:
                 z1 = self.model(view1)
                 
                 if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                    # Lightly NTXentLoss expects a list of views: [view0, z1]
-                    loss = self.criterion([z0, z1])
+                    # Lightly NTXentLoss expects two separate arguments: out0, out1
+                    loss = self.criterion(z0, z1)
                 else:
                     # Custom loss expects two separate tensors
                     loss = self.criterion(z0, z1)
