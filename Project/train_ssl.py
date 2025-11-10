@@ -155,10 +155,39 @@ class SSLTrainer:
         use_lightly_collate = False
         if LIGHTLY_AVAILABLE:
             # SimCLRCollateFunction expects PIL images, so load dataset WITHOUT transforms
-            unlabeled_dataset = self.dataset_loader.get_unlabeled_dataset(
+            unlabeled_dataset_raw = self.dataset_loader.get_unlabeled_dataset(
                 transform=None,  # No transform - SimCLRCollateFunction will handle augmentation
                 download=True
             )
+            
+            # Wrap dataset to provide (image, label, filename) format expected by SimCLRCollateFunction
+            class DatasetWithFilename:
+                """Wrapper to add filename to dataset items."""
+                def __init__(self, dataset):
+                    self.dataset = dataset
+                
+                def __len__(self):
+                    return len(self.dataset)
+                
+                def __getitem__(self, idx):
+                    item = self.dataset[idx]
+                    # STL-10 returns (image, label) or (image,)
+                    if isinstance(item, tuple):
+                        if len(item) == 2:
+                            image, label = item
+                            # Add dummy filename
+                            return (image, label, f"image_{idx}.png")
+                        elif len(item) == 1:
+                            image = item[0]
+                            return (image, -1, f"image_{idx}.png")
+                        else:
+                            # Already has filename?
+                            return item
+                    else:
+                        # Just image
+                        return (item, -1, f"image_{idx}.png")
+            
+            unlabeled_dataset = DatasetWithFilename(unlabeled_dataset_raw)
             
             # Try to use SimCLRCollateFunction with correct API
             # Different versions of lightly may have different APIs
