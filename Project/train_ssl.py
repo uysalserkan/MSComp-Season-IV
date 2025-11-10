@@ -74,7 +74,9 @@ class NTXentLossCustom(nn.Module):
         # Compute similarity matrix
         similarity_matrix = torch.matmul(z, z.T) / self.temperature  # (2*batch_size, 2*batch_size)
         
-        # Create labels: positive pairs are (i, i+batch_size) and (i+batch_size, i)
+        # Create labels: positive pairs are (i, i+batch_size) for i in [0, batch_size-1]
+        # For sample i: positive is at index i+batch_size
+        # For sample i+batch_size: positive is at index i
         labels = torch.arange(batch_size, device=z.device)
         labels = torch.cat([labels + batch_size, labels], dim=0)  # (2*batch_size,)
         
@@ -83,6 +85,7 @@ class NTXentLossCustom(nn.Module):
         similarity_matrix = similarity_matrix.masked_fill(mask, float('-inf'))
         
         # Compute cross-entropy loss
+        # Each row i should predict label labels[i]
         loss = nn.functional.cross_entropy(similarity_matrix, labels)
         
         return loss
@@ -137,20 +140,20 @@ class SSLTrainer:
             download=True
         )
         
-        # Get contrastive transform
+        # Get contrastive transform for custom collate function
         contrastive_transform = self.dataset_loader.get_contrastive_transform(
             image_size=config.image_size,
             use_strong_augmentation=config.use_strong_augmentation
         )
         
-        # Get unlabeled dataset
-        unlabeled_dataset = self.dataset_loader.get_unlabeled_dataset(
-            transform=contrastive_transform,
-            download=True
-        )
-        
         # Create collate function for two-view augmentation
         if LIGHTLY_AVAILABLE:
+            # SimCLRCollateFunction expects PIL images, so load dataset WITHOUT transforms
+            unlabeled_dataset = self.dataset_loader.get_unlabeled_dataset(
+                transform=None,  # No transform - SimCLRCollateFunction will handle augmentation
+                download=True
+            )
+            
             collate_fn = SimCLRCollateFunction(
                 input_size=config.image_size,
                 cj_prob=0.8,
@@ -170,13 +173,36 @@ class SSLTrainer:
                 }
             )
         else:
-            # Custom collate function for two views
-            def collate_fn(batch):
-                images = torch.stack([item[0] for item in batch])
-                # Create second view with same transform (simplified)
-                # In practice, you'd apply different random augmentations
-                images_view1 = images.clone()
-                return images, images_view1
+            # For custom collate, load dataset WITHOUT transforms (PIL images)
+            # We'll apply transforms in the collate function to get two different views
+            unlabeled_dataset = self.dataset_loader.get_unlabeled_dataset(
+                transform=None,  # No transform - we'll apply in collate function
+                download=True
+            )
+            
+            # Custom collate function that creates two different augmented views
+            # We need to apply the transform twice with different random states
+            class TwoViewCollate:
+                def __init__(self, transform):
+                    self.transform = transform
+                
+                def __call__(self, batch):
+                    # Apply transform twice to get two different views
+                    view0_list = []
+                    view1_list = []
+                    
+                    for item in batch:
+                        image = item[0]  # PIL image (since transform=None)
+                        # Apply transform twice (will have different random augmentations)
+                        view0_list.append(self.transform(image))
+                        view1_list.append(self.transform(image))
+                    
+                    view0 = torch.stack(view0_list)
+                    view1 = torch.stack(view1_list)
+                    return view0, view1
+            
+            # Create collate function
+            collate_fn = TwoViewCollate(contrastive_transform)
         
         # Create data loader
         self.train_loader = torch.utils.data.DataLoader(
@@ -285,16 +311,31 @@ class SSLTrainer:
         
         for batch_idx, batch in enumerate(pbar):
             # Get two augmented views from collate function
-            if isinstance(batch, tuple) and len(batch) == 2:
+            # SimCLRCollateFunction returns (views, labels, filenames) where views is a list
+            if LIGHTLY_AVAILABLE and isinstance(batch, tuple) and len(batch) >= 2:
+                # Lightly format: (views, labels, filenames) or (views, labels)
+                views = batch[0]
+                if isinstance(views, (list, tuple)) and len(views) >= 2:
+                    # views is a list/tuple of tensors, one for each view
+                    view0 = views[0].to(self.device)
+                    view1 = views[1].to(self.device)
+                else:
+                    raise ValueError(f"Unexpected views format from lightly: {type(views)}, expected list/tuple with 2+ views")
+            elif isinstance(batch, tuple) and len(batch) == 2:
+                # Custom collate format: (view0, view1)
                 view0, view1 = batch
+                view0 = view0.to(self.device)
+                view1 = view1.to(self.device)
             else:
                 # Fallback: create two views from single batch
-                images = batch.to(self.device)
+                if isinstance(batch, torch.Tensor):
+                    images = batch.to(self.device)
+                elif isinstance(batch, (list, tuple)) and len(batch) > 0:
+                    images = batch[0].to(self.device)
+                else:
+                    raise ValueError(f"Unexpected batch format: {type(batch)}")
                 view0 = images
                 view1 = images.clone()
-            
-            view0 = view0.to(self.device)
-            view1 = view1.to(self.device)
             
             # Forward pass with mixed precision
             if self.config.mixed_precision:
@@ -304,10 +345,11 @@ class SSLTrainer:
                     
                     # Compute contrastive loss
                     if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                        # Lightly expects concatenated features
-                        features = torch.cat([z0, z1], dim=0)
-                        loss = self.criterion(features)
+                        # Lightly NTXentLoss expects a list of views: [view0, view1]
+                        # Each view should be (batch_size, projection_dim)
+                        loss = self.criterion([z0, z1])
                     else:
+                        # Custom loss expects two separate tensors
                         loss = self.criterion(z0, z1)
                     
                     loss = loss / self.config.gradient_accumulation_steps
@@ -316,9 +358,10 @@ class SSLTrainer:
                 z1 = self.model(view1)
                 
                 if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                    features = torch.cat([z0, z1], dim=0)
-                    loss = self.criterion(features)
+                    # Lightly NTXentLoss expects a list of views: [view0, z1]
+                    loss = self.criterion([z0, z1])
                 else:
+                    # Custom loss expects two separate tensors
                     loss = self.criterion(z0, z1)
                 
                 loss = loss / self.config.gradient_accumulation_steps
