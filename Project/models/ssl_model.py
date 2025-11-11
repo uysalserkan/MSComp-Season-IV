@@ -170,6 +170,9 @@ class ContrastiveViT(nn.Module):
         # Initialize projection head weights for stability
         self.projection_head._initialize_weights()
         
+        # Initialize backbone weights for numerical stability (especially patch_embed)
+        self._initialize_backbone()
+        
         # Freeze backbone if requested
         if freeze_backbone:
             self.freeze_backbone()
@@ -177,6 +180,22 @@ class ContrastiveViT(nn.Module):
         # Optionally freeze positional embeddings (often causes NaN gradients)
         # This can be enabled via a method call after initialization
         self._freeze_pos_embed = False
+    
+    def _initialize_backbone(self) -> None:
+        """
+        Initialize backbone weights for numerical stability.
+        
+        Applies very conservative initialization to patch embedding convolution
+        to prevent NaN gradients in early training.
+        """
+        for name, module in self.backbone.named_modules():
+            if 'patch_embed' in name and isinstance(module, nn.Conv2d):
+                # Very conservative initialization for patch embedding
+                # Using Xavier with very small gain to prevent extreme activations
+                nn.init.xavier_uniform_(module.weight, gain=0.02)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+                print(f"Initialized {name} with conservative gain (0.02) for stability")
     
     def freeze_pos_embed(self) -> None:
         """Freeze positional embeddings to prevent NaN gradient issues."""
@@ -268,6 +287,101 @@ class ContrastiveViT(nn.Module):
         if return_features:
             return projection, features
         return projection
+    
+    def get_param_groups(self, base_lr: float, weight_decay: float = 1e-4) -> list:
+        """
+        Get parameter groups with layer-wise discriminative learning rates.
+        
+        Early layers (patch_embed, pos_embed) get lower LRs to prevent NaN gradients.
+        Later layers get progressively higher LRs.
+        
+        Args:
+            base_lr: Base learning rate for late layers and projection head.
+            weight_decay: Weight decay for all parameter groups.
+        
+        Returns:
+            List of parameter group dictionaries for optimizer.
+        """
+        patch_embed_params = []
+        pos_embed_params = []
+        early_block_params = []
+        middle_block_params = []
+        late_block_params = []
+        other_params = []
+        projection_params = list(self.projection_head.parameters())
+        
+        for name, param in self.backbone.named_parameters():
+            if 'patch_embed' in name:
+                patch_embed_params.append(param)
+            elif 'pos_embed' in name or 'cls_token' in name:
+                pos_embed_params.append(param)
+            elif 'blocks' in name:
+                # Extract block number from parameter name
+                # Name format: blocks.N.xxx where N is the block number
+                try:
+                    block_num = int(name.split('blocks.')[1].split('.')[0])
+                    if block_num < 4:
+                        early_block_params.append(param)
+                    elif block_num < 8:
+                        middle_block_params.append(param)
+                    else:
+                        late_block_params.append(param)
+                except (IndexError, ValueError):
+                    # If we can't parse block number, put in other_params
+                    other_params.append(param)
+            else:
+                # Any other backbone parameters (norm layers, etc.)
+                other_params.append(param)
+        
+        param_groups = [
+            {
+                'params': patch_embed_params,
+                'lr': base_lr * 0.1,
+                'weight_decay': weight_decay,
+                'name': 'patch_embed'
+            },
+            {
+                'params': pos_embed_params,
+                'lr': base_lr * 0.1,
+                'weight_decay': weight_decay,
+                'name': 'pos_embed'
+            },
+            {
+                'params': early_block_params,
+                'lr': base_lr * 0.3,
+                'weight_decay': weight_decay,
+                'name': 'early_blocks'
+            },
+            {
+                'params': middle_block_params,
+                'lr': base_lr * 0.6,
+                'weight_decay': weight_decay,
+                'name': 'middle_blocks'
+            },
+            {
+                'params': late_block_params,
+                'lr': base_lr * 1.0,
+                'weight_decay': weight_decay,
+                'name': 'late_blocks'
+            },
+            {
+                'params': other_params,
+                'lr': base_lr * 1.0,
+                'weight_decay': weight_decay,
+                'name': 'other_backbone'
+            },
+            {
+                'params': projection_params,
+                'lr': base_lr * 1.0,
+                'weight_decay': weight_decay,
+                'name': 'projection_head'
+            }
+        ]
+        
+        # Filter out empty parameter groups
+        param_groups = [group for group in param_groups if len(group['params']) > 0]
+        
+        return param_groups
     
     def get_backbone(self) -> nn.Module:
         """

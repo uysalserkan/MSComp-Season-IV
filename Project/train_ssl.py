@@ -308,12 +308,24 @@ class SSLTrainer:
         else:
             self.criterion = NTXentLossCustom(temperature=config.temperature)
         
-        # Optimizer
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=config.learning_rate,
+        # Optimizer with layer-wise discriminative learning rates
+        # Early layers (patch_embed, pos_embed) get 10x lower LR to prevent NaN gradients
+        param_groups = self.model.get_param_groups(
+            base_lr=config.learning_rate,
             weight_decay=config.weight_decay
         )
+        self.optimizer = optim.AdamW(param_groups)
+        
+        # Store initial LR for each param group (needed for warmup)
+        for param_group in self.optimizer.param_groups:
+            param_group['initial_lr'] = param_group['lr']
+        
+        # Print layer-wise learning rates for transparency
+        print("\nLayer-wise Learning Rates:")
+        for group in param_groups:
+            num_params = sum(p.numel() for p in group['params'])
+            print(f"  {group['name']}: LR={group['lr']:.6f}, Params={num_params:,}")
+        print()
         
         # Learning rate scheduler with warmup
         self.scheduler = self._get_scheduler()
@@ -359,13 +371,32 @@ class SSLTrainer:
         else:
             return None
     
-    def _get_warmup_lr(self, epoch: int) -> float:
-        """Get learning rate with warmup."""
+    def _get_warmup_lr(self, epoch: int) -> dict:
+        """
+        Get learning rates for each param group with warmup.
+        
+        Args:
+            epoch: Current epoch number.
+        
+        Returns:
+            Dictionary mapping param group index to learning rate.
+        """
         if epoch < self.config.warmup_epochs:
-            # Linear warmup
-            return self.config.learning_rate * (epoch + 1) / self.config.warmup_epochs
+            # Linear warmup - scale each group's base LR
+            warmup_factor = (epoch + 1) / self.config.warmup_epochs
+            # Each param group has its own base LR stored in 'lr' key
+            # We need to get the base LR for each group (stored when optimizer was created)
+            warmup_lrs = {}
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                # The base LR for this group is stored in the param_group
+                # We need to scale it by warmup factor
+                base_lr = param_group['lr'] if epoch == 0 else param_group.get('initial_lr', param_group['lr'])
+                warmup_lrs[i] = base_lr * warmup_factor
+            return warmup_lrs
         else:
-            return self.config.learning_rate
+            # Return base LRs for each group
+            return {i: param_group.get('initial_lr', param_group['lr']) 
+                    for i, param_group in enumerate(self.optimizer.param_groups)}
     
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint and resume training."""
@@ -446,16 +477,16 @@ class SSLTrainer:
         running_loss = 0.0
         num_batches = 0
         
-        # Set learning rate with warmup
+        # Set learning rate with warmup (handles multiple param groups with different base LRs)
         if epoch < self.config.warmup_epochs:
-            warmup_lr = self._get_warmup_lr(epoch)
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = warmup_lr
+            warmup_lrs = self._get_warmup_lr(epoch)
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = warmup_lrs[i]
         elif epoch == self.config.warmup_epochs:
             # Ensure smooth transition: set to base LR when warmup ends
-            # This ensures scheduler starts from correct base LR
+            # This ensures scheduler starts from correct base LR for each group
             for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.config.learning_rate
+                param_group['lr'] = param_group['initial_lr']
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.epochs} [SSL]")
         
@@ -817,7 +848,7 @@ class SSLTrainer:
             loss_value = loss.item() * self.config.gradient_accumulation_steps
             if not (torch.isnan(torch.tensor(loss_value)) or torch.isinf(torch.tensor(loss_value))):
                 running_loss += loss_value
-                num_batches += 1
+            num_batches += 1
             
             # Update progress bar with additional debug info
             if (batch_idx + 1) % self.config.print_freq == 0:
