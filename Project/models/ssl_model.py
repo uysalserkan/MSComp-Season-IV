@@ -175,7 +175,9 @@ class ContrastiveViT(nn.Module):
         
         # Normalize projection (important for contrastive learning)
         if normalize:
-            projection = nn.functional.normalize(projection, dim=1)
+            # Add small epsilon to prevent division by zero for zero vectors
+            # This ensures numerical stability during normalization
+            projection = nn.functional.normalize(projection + 1e-8, dim=1)
         
         if return_features:
             return projection, features

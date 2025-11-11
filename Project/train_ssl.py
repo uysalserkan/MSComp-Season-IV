@@ -60,7 +60,7 @@ class NTXentLossCustom(nn.Module):
             temperature: Temperature parameter for scaling logits.
         """
         super(NTXentLossCustom, self).__init__()
-        self.temperature = temperature
+        self.temperature = max(temperature, 1e-8)  # Ensure temperature is positive
     
     def forward(self, z0: torch.Tensor, z1: torch.Tensor) -> torch.Tensor:
         """
@@ -75,11 +75,21 @@ class NTXentLossCustom(nn.Module):
         """
         batch_size = z0.shape[0]
         
+        # Validate inputs for NaN/Inf
+        if torch.isnan(z0).any() or torch.isinf(z0).any():
+            raise ValueError("z0 contains NaN or Inf values")
+        if torch.isnan(z1).any() or torch.isinf(z1).any():
+            raise ValueError("z1 contains NaN or Inf values")
+        
         # Concatenate embeddings
         z = torch.cat([z0, z1], dim=0)  # (2*batch_size, dim)
         
-        # Compute similarity matrix
-        similarity_matrix = torch.matmul(z, z.T) / self.temperature  # (2*batch_size, 2*batch_size)
+        # Compute similarity matrix with numerical stability
+        # Add epsilon to temperature to prevent division issues
+        similarity_matrix = torch.matmul(z, z.T) / (self.temperature + 1e-8)  # (2*batch_size, 2*batch_size)
+        
+        # Clamp logits to prevent extreme values that can cause numerical instability
+        similarity_matrix = torch.clamp(similarity_matrix, min=-50.0, max=50.0)
         
         # Create labels: positive pairs are (i, i+batch_size) for i in [0, batch_size-1]
         # For sample i: positive is at index i+batch_size
@@ -94,6 +104,10 @@ class NTXentLossCustom(nn.Module):
         # Compute cross-entropy loss
         # Each row i should predict label labels[i]
         loss = nn.functional.cross_entropy(similarity_matrix, labels)
+        
+        # Check for NaN/Inf in loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise ValueError(f"Loss is NaN or Inf. Similarity matrix stats: min={similarity_matrix.min():.4f}, max={similarity_matrix.max():.4f}, mean={similarity_matrix.mean():.4f}")
         
         return loss
 
@@ -320,17 +334,24 @@ class SSLTrainer:
         """Get learning rate scheduler with warmup."""
         if self.config.lr_scheduler == "cosine":
             # Cosine annealing after warmup
-            return optim.lr_scheduler.CosineAnnealingLR(
+            # Initialize with last_epoch=-1 so scheduler doesn't step during warmup
+            # We'll manually step it starting from warmup_epochs
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.config.epochs - self.config.warmup_epochs,
-                eta_min=self.config.lr_min
+                eta_min=self.config.lr_min,
+                last_epoch=-1  # Start from -1 so it doesn't step during warmup
             )
+            return scheduler
         elif self.config.lr_scheduler == "step":
-            return optim.lr_scheduler.StepLR(
+            # StepLR also needs to account for warmup
+            scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer,
                 step_size=self.config.epochs // 3,
-                gamma=0.1
+                gamma=0.1,
+                last_epoch=-1  # Start from -1 so it doesn't step during warmup
             )
+            return scheduler
         else:
             return None
     
@@ -426,6 +447,11 @@ class SSLTrainer:
             warmup_lr = self._get_warmup_lr(epoch)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = warmup_lr
+        elif epoch == self.config.warmup_epochs:
+            # Ensure smooth transition: set to base LR when warmup ends
+            # This ensures scheduler starts from correct base LR
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.config.learning_rate
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.epochs} [SSL]")
         
@@ -468,6 +494,14 @@ class SSLTrainer:
                 if view1.dim() != 4:
                     raise ValueError(f"view1 has wrong number of dimensions: {view1.dim()}, expected 4. Shape: {view1.shape}")
                 
+                # Check for NaN/Inf in input views
+                if torch.isnan(view0).any() or torch.isinf(view0).any():
+                    print(f"Warning: view0 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Skipping batch.")
+                    continue
+                if torch.isnan(view1).any() or torch.isinf(view1).any():
+                    print(f"Warning: view1 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Skipping batch.")
+                    continue
+                
             except Exception as e:
                 print(f"\nError processing batch at index {batch_idx}: {e}")
                 print(f"Batch type: {type(batch)}")
@@ -485,30 +519,78 @@ class SSLTrainer:
             
             # Forward pass with mixed precision
             if self.config.mixed_precision:
-                with autocast():
+                with autocast(enabled=True):
                     z0 = self.model(view0)
                     z1 = self.model(view1)
                     
+                    # Validate embeddings for NaN/Inf before loss computation
+                    if torch.isnan(z0).any() or torch.isinf(z0).any():
+                        print(f"Warning: z0 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Embedding stats: min={z0.min():.4f}, max={z0.max():.4f}, mean={z0.mean():.4f}")
+                        continue
+                    if torch.isnan(z1).any() or torch.isinf(z1).any():
+                        print(f"Warning: z1 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Embedding stats: min={z1.min():.4f}, max={z1.max():.4f}, mean={z1.mean():.4f}")
+                        continue
+                    
+                    # Check for zero vectors (can cause normalization issues)
+                    z0_norm = torch.norm(z0, dim=1)
+                    z1_norm = torch.norm(z1, dim=1)
+                    if (z0_norm < 1e-8).any() or (z1_norm < 1e-8).any():
+                        print(f"Warning: Zero or near-zero embeddings detected at batch {batch_idx}, epoch {epoch}. Skipping batch.")
+                        continue
+                    
                     # Compute contrastive loss
-                    if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                        # Lightly NTXentLoss expects two separate arguments: out0, out1
-                        # Each view should be (batch_size, projection_dim)
-                        loss = self.criterion(z0, z1)
-                    else:
-                        # Custom loss expects two separate tensors
-                        loss = self.criterion(z0, z1)
+                    try:
+                        if LIGHTLY_AVAILABLE and self.config.method == "simclr":
+                            # Lightly NTXentLoss expects two separate arguments: out0, out1
+                            # Each view should be (batch_size, projection_dim)
+                            loss = self.criterion(z0, z1)
+                        else:
+                            # Custom loss expects two separate tensors
+                            loss = self.criterion(z0, z1)
+                    except (ValueError, RuntimeError) as e:
+                        print(f"Error computing loss at batch {batch_idx}, epoch {epoch}: {e}")
+                        continue
+                    
+                    # Validate loss before proceeding
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Warning: Loss is NaN/Inf at batch {batch_idx}, epoch {epoch}. Skipping batch.")
+                        continue
                     
                     loss = loss / self.config.gradient_accumulation_steps
             else:
                 z0 = self.model(view0)
                 z1 = self.model(view1)
                 
-                if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                    # Lightly NTXentLoss expects two separate arguments: out0, out1
-                    loss = self.criterion(z0, z1)
-                else:
-                    # Custom loss expects two separate tensors
-                    loss = self.criterion(z0, z1)
+                # Validate embeddings for NaN/Inf before loss computation
+                if torch.isnan(z0).any() or torch.isinf(z0).any():
+                    print(f"Warning: z0 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Embedding stats: min={z0.min():.4f}, max={z0.max():.4f}, mean={z0.mean():.4f}")
+                    continue
+                if torch.isnan(z1).any() or torch.isinf(z1).any():
+                    print(f"Warning: z1 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Embedding stats: min={z1.min():.4f}, max={z1.max():.4f}, mean={z1.mean():.4f}")
+                    continue
+                
+                # Check for zero vectors (can cause normalization issues)
+                z0_norm = torch.norm(z0, dim=1)
+                z1_norm = torch.norm(z1, dim=1)
+                if (z0_norm < 1e-8).any() or (z1_norm < 1e-8).any():
+                    print(f"Warning: Zero or near-zero embeddings detected at batch {batch_idx}, epoch {epoch}. Skipping batch.")
+                    continue
+                
+                try:
+                    if LIGHTLY_AVAILABLE and self.config.method == "simclr":
+                        # Lightly NTXentLoss expects two separate arguments: out0, out1
+                        loss = self.criterion(z0, z1)
+                    else:
+                        # Custom loss expects two separate tensors
+                        loss = self.criterion(z0, z1)
+                except (ValueError, RuntimeError) as e:
+                    print(f"Error computing loss at batch {batch_idx}, epoch {epoch}: {e}")
+                    continue
+                
+                # Validate loss before proceeding
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: Loss is NaN/Inf at batch {batch_idx}, epoch {epoch}. Skipping batch.")
+                    continue
                 
                 loss = loss / self.config.gradient_accumulation_steps
             
@@ -524,9 +606,31 @@ class SSLTrainer:
             is_last_batch = (batch_idx + 1) == len(self.train_loader)
             
             if should_update or is_last_batch:
+                # Check gradients for NaN/Inf before updating
+                has_nan_grad = False
+                if self.config.mixed_precision:
+                    self.scaler.unscale_(self.optimizer)
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"Warning: NaN/Inf gradient detected in {name} at batch {batch_idx}, epoch {epoch}")
+                                has_nan_grad = True
+                                break
+                else:
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"Warning: NaN/Inf gradient detected in {name} at batch {batch_idx}, epoch {epoch}")
+                                has_nan_grad = True
+                                break
+                
+                if has_nan_grad:
+                    # Skip this update, zero gradients, and continue
+                    self.optimizer.zero_grad()
+                    continue
+                
                 if self.config.mixed_precision:
                     if self.config.gradient_clip_norm:
-                        self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.config.gradient_clip_norm
@@ -544,25 +648,50 @@ class SSLTrainer:
                 self.optimizer.zero_grad()
             
             # Accumulate loss
-            running_loss += loss.item() * self.config.gradient_accumulation_steps
-            num_batches += 1
+            loss_value = loss.item() * self.config.gradient_accumulation_steps
+            if not (torch.isnan(torch.tensor(loss_value)) or torch.isinf(torch.tensor(loss_value))):
+                running_loss += loss_value
+                num_batches += 1
             
-            # Update progress bar
+            # Update progress bar with additional debug info
             if (batch_idx + 1) % self.config.print_freq == 0:
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                avg_loss_display = running_loss / num_batches if num_batches > 0 else 0.0
+                
+                # Compute gradient norm for debugging (only if gradients exist)
+                total_norm = 0.0
+                grad_count = 0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                        grad_count += 1
+                if grad_count > 0:
+                    total_norm = total_norm ** (1. / 2)
+                
                 pbar.set_postfix({
-                    'loss': f'{running_loss/num_batches:.4f}',
-                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
+                    'loss': f'{avg_loss_display:.4f}',
+                    'lr': f'{current_lr:.6f}',
+                    'grad_norm': f'{total_norm:.2f}' if grad_count > 0 else 'N/A'
                 })
         
         # Defensive check for empty batches
         if num_batches == 0:
             raise RuntimeError("No batches were processed in this epoch. Check your data loader configuration.")
         
-        avg_loss = running_loss / num_batches
+        avg_loss = running_loss / num_batches if num_batches > 0 else float('inf')
+        
+        # Validate average loss
+        if torch.isnan(torch.tensor(avg_loss)) or torch.isinf(torch.tensor(avg_loss)):
+            print(f"Warning: Average loss is NaN/Inf at epoch {epoch}. This may indicate training instability.")
         
         # Update learning rate scheduler (after warmup)
         if self.scheduler and epoch >= self.config.warmup_epochs:
             self.scheduler.step()
+            # Log LR after scheduler step for debugging
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            if (epoch + 1) % 5 == 0:  # Log every 5 epochs
+                print(f"  Scheduler LR: {current_lr:.8f}")
         
         return avg_loss
     
