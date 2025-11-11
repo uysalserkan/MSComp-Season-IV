@@ -13,7 +13,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from models.ssl_model import ContrastiveViT
@@ -319,7 +319,11 @@ class SSLTrainer:
         self.scheduler = self._get_scheduler()
         
         # Mixed precision scaler
-        self.scaler = GradScaler() if config.mixed_precision else None
+        # Use new API to avoid deprecation warning
+        if config.mixed_precision:
+            self.scaler = GradScaler('cuda')
+        else:
+            self.scaler = None
         
         # Training state
         self.start_epoch = 0
@@ -519,7 +523,7 @@ class SSLTrainer:
             
             # Forward pass with mixed precision
             if self.config.mixed_precision:
-                with autocast(enabled=True):
+                with autocast(device_type='cuda', enabled=True):
                     try:
                         z0 = self.model(view0)
                         z1 = self.model(view1)
@@ -577,8 +581,8 @@ class SSLTrainer:
                     loss = loss / self.config.gradient_accumulation_steps
             else:
                 try:
-                    z0 = self.model(view0)
-                    z1 = self.model(view1)
+                z0 = self.model(view0)
+                z1 = self.model(view1)
                 except ValueError as e:
                     print(f"Error in model forward pass at batch {batch_idx}, epoch {epoch}: {e}")
                     print(f"  View0 stats: min={view0.min():.4f}, max={view0.max():.4f}, mean={view0.mean():.4f}")
@@ -604,12 +608,12 @@ class SSLTrainer:
                     continue
                 
                 try:
-                    if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                        # Lightly NTXentLoss expects two separate arguments: out0, out1
-                        loss = self.criterion(z0, z1)
-                    else:
-                        # Custom loss expects two separate tensors
-                        loss = self.criterion(z0, z1)
+                if LIGHTLY_AVAILABLE and self.config.method == "simclr":
+                    # Lightly NTXentLoss expects two separate arguments: out0, out1
+                    loss = self.criterion(z0, z1)
+                else:
+                    # Custom loss expects two separate tensors
+                    loss = self.criterion(z0, z1)
                 except (ValueError, RuntimeError) as e:
                     print(f"Error computing loss at batch {batch_idx}, epoch {epoch}: {e}")
                     continue
@@ -641,7 +645,7 @@ class SSLTrainer:
                 
                 if self.config.mixed_precision:
                     # Unscale gradients (required before clipping and checking)
-                    self.scaler.unscale_(self.optimizer)
+                        self.scaler.unscale_(self.optimizer)
                     
                     # Check for NaN/Inf gradients
                     for name, param in self.model.named_parameters():
@@ -682,32 +686,46 @@ class SSLTrainer:
                     
                     # Apply gradient clipping if needed (do this after handling NaN)
                     if self.config.gradient_clip_norm:
-                        # Clip gradients more aggressively for positional embeddings
-                        # Separate clipping for pos_embed and other parameters
+                        # Clip gradients more aggressively for positional embeddings and projection head
+                        # Separate clipping for different parameter groups
                         pos_embed_params = []
+                        projection_params = []
                         other_params = []
                         for name, param in self.model.named_parameters():
                             if param.grad is not None:
                                 if 'pos_embed' in name:
                                     pos_embed_params.append(param)
+                                elif 'projection_head' in name:
+                                    projection_params.append(param)
                                 else:
                                     other_params.append(param)
                         
-                        # Clip positional embeddings more aggressively
+                        # Clip positional embeddings very aggressively
                         if pos_embed_params:
                             torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
+                        
+                        # Clip projection head moderately aggressively
+                        if projection_params:
+                            torch.nn.utils.clip_grad_norm_(projection_params, max_norm=0.5)
                         
                         # Clip other parameters normally
                         if other_params:
                             torch.nn.utils.clip_grad_norm_(other_params, self.config.gradient_clip_norm)
                     else:
-                        # Even without general clipping, clip positional embeddings
+                        # Even without general clipping, clip problematic parameters
                         pos_embed_params = []
+                        projection_params = []
                         for name, param in self.model.named_parameters():
-                            if param.grad is not None and 'pos_embed' in name:
-                                pos_embed_params.append(param)
+                            if param.grad is not None:
+                                if 'pos_embed' in name:
+                                    pos_embed_params.append(param)
+                                elif 'projection_head' in name:
+                                    projection_params.append(param)
+                        
                         if pos_embed_params:
                             torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
+                        if projection_params:
+                            torch.nn.utils.clip_grad_norm_(projection_params, max_norm=0.5)
                     
                     # Step optimizer and update scaler
                     self.scaler.step(self.optimizer)
@@ -750,31 +768,45 @@ class SSLTrainer:
                     
                     # Apply gradient clipping if needed
                     if self.config.gradient_clip_norm:
-                        # Clip gradients more aggressively for positional embeddings
+                        # Clip gradients more aggressively for positional embeddings and projection head
                         pos_embed_params = []
+                        projection_params = []
                         other_params = []
                         for name, param in self.model.named_parameters():
                             if param.grad is not None:
                                 if 'pos_embed' in name:
                                     pos_embed_params.append(param)
+                                elif 'projection_head' in name:
+                                    projection_params.append(param)
                                 else:
                                     other_params.append(param)
                         
-                        # Clip positional embeddings more aggressively
+                        # Clip positional embeddings very aggressively
                         if pos_embed_params:
                             torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
+                        
+                        # Clip projection head moderately aggressively
+                        if projection_params:
+                            torch.nn.utils.clip_grad_norm_(projection_params, max_norm=0.5)
                         
                         # Clip other parameters normally
                         if other_params:
                             torch.nn.utils.clip_grad_norm_(other_params, self.config.gradient_clip_norm)
                     else:
-                        # Even without general clipping, clip positional embeddings
+                        # Even without general clipping, clip problematic parameters
                         pos_embed_params = []
+                        projection_params = []
                         for name, param in self.model.named_parameters():
-                            if param.grad is not None and 'pos_embed' in name:
-                                pos_embed_params.append(param)
+                            if param.grad is not None:
+                                if 'pos_embed' in name:
+                                    pos_embed_params.append(param)
+                                elif 'projection_head' in name:
+                                    projection_params.append(param)
+                        
                         if pos_embed_params:
                             torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
+                        if projection_params:
+                            torch.nn.utils.clip_grad_norm_(projection_params, max_norm=0.5)
                     
                     # Step optimizer
                     self.optimizer.step()
