@@ -173,6 +173,26 @@ class ContrastiveViT(nn.Module):
         # Freeze backbone if requested
         if freeze_backbone:
             self.freeze_backbone()
+        
+        # Optionally freeze positional embeddings (often causes NaN gradients)
+        # This can be enabled via a method call after initialization
+        self._freeze_pos_embed = False
+    
+    def freeze_pos_embed(self) -> None:
+        """Freeze positional embeddings to prevent NaN gradient issues."""
+        for name, param in self.backbone.named_parameters():
+            if 'pos_embed' in name:
+                param.requires_grad = False
+                self._freeze_pos_embed = True
+        if self._freeze_pos_embed:
+            print("Positional embeddings frozen to prevent NaN gradients")
+    
+    def unfreeze_pos_embed(self) -> None:
+        """Unfreeze positional embeddings."""
+        for name, param in self.backbone.named_parameters():
+            if 'pos_embed' in name:
+                param.requires_grad = True
+                self._freeze_pos_embed = False
     
     def freeze_backbone(self) -> None:
         """Freeze all backbone parameters."""

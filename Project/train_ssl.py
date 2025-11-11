@@ -637,6 +637,7 @@ class SSLTrainer:
                 # For mixed precision, we need to unscale first to check properly
                 # But we must ensure scaler state is handled correctly
                 has_nan_grad = False
+                nan_grad_params = []  # Track which parameters have NaN gradients
                 
                 if self.config.mixed_precision:
                     # Unscale gradients (required before clipping and checking)
@@ -647,24 +648,66 @@ class SSLTrainer:
                         if param.grad is not None:
                             if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                                 print(f"Warning: NaN/Inf gradient detected in {name} at batch {batch_idx}, epoch {epoch}")
+                                nan_grad_params.append(name)
                                 has_nan_grad = True
-                                break
                     
+                    # Handle NaN gradients: zero out gradients for problematic parameters
+                    # Positional embeddings often get NaN gradients - zero them out instead of skipping batch
                     if has_nan_grad:
-                        # Skip this update, zero gradients, and reset scaler state
-                        # We need to call update() to reset scaler state even though we're skipping
-                        self.optimizer.zero_grad()
-                        # Reset scaler by calling update() without stepping
-                        # This resets the scaler's internal state
-                        self.scaler.update()
-                        continue
+                        for name, param in self.model.named_parameters():
+                            if name in nan_grad_params:
+                                if param.grad is not None:
+                                    # Zero out NaN/Inf gradients for this parameter
+                                    param.grad = torch.where(
+                                        torch.isnan(param.grad) | torch.isinf(param.grad),
+                                        torch.zeros_like(param.grad),
+                                        param.grad
+                                    )
+                                    print(f"  Zeroed out NaN/Inf gradients for {name}")
+                        
+                        # Check if we still have NaN gradients after zeroing
+                        still_has_nan = False
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    still_has_nan = True
+                                    break
+                        
+                        if still_has_nan:
+                            # If still has NaN after zeroing, skip this update
+                            print(f"  Still has NaN gradients after zeroing. Skipping batch.")
+                            self.optimizer.zero_grad()
+                            self.scaler.update()
+                            continue
                     
-                    # Apply gradient clipping if needed
+                    # Apply gradient clipping if needed (do this after handling NaN)
                     if self.config.gradient_clip_norm:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.config.gradient_clip_norm
-                        )
+                        # Clip gradients more aggressively for positional embeddings
+                        # Separate clipping for pos_embed and other parameters
+                        pos_embed_params = []
+                        other_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None:
+                                if 'pos_embed' in name:
+                                    pos_embed_params.append(param)
+                                else:
+                                    other_params.append(param)
+                        
+                        # Clip positional embeddings more aggressively
+                        if pos_embed_params:
+                            torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
+                        
+                        # Clip other parameters normally
+                        if other_params:
+                            torch.nn.utils.clip_grad_norm_(other_params, self.config.gradient_clip_norm)
+                    else:
+                        # Even without general clipping, clip positional embeddings
+                        pos_embed_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None and 'pos_embed' in name:
+                                pos_embed_params.append(param)
+                        if pos_embed_params:
+                            torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
                     
                     # Step optimizer and update scaler
                     self.scaler.step(self.optimizer)
@@ -675,20 +718,63 @@ class SSLTrainer:
                         if param.grad is not None:
                             if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                                 print(f"Warning: NaN/Inf gradient detected in {name} at batch {batch_idx}, epoch {epoch}")
+                                nan_grad_params.append(name)
                                 has_nan_grad = True
-                                break
                     
+                    # Handle NaN gradients: zero out gradients for problematic parameters
                     if has_nan_grad:
-                        # Skip this update, zero gradients
-                        self.optimizer.zero_grad()
-                        continue
+                        for name, param in self.model.named_parameters():
+                            if name in nan_grad_params:
+                                if param.grad is not None:
+                                    # Zero out NaN/Inf gradients for this parameter
+                                    param.grad = torch.where(
+                                        torch.isnan(param.grad) | torch.isinf(param.grad),
+                                        torch.zeros_like(param.grad),
+                                        param.grad
+                                    )
+                                    print(f"  Zeroed out NaN/Inf gradients for {name}")
+                        
+                        # Check if we still have NaN gradients after zeroing
+                        still_has_nan = False
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    still_has_nan = True
+                                    break
+                        
+                        if still_has_nan:
+                            # If still has NaN after zeroing, skip this update
+                            print(f"  Still has NaN gradients after zeroing. Skipping batch.")
+                            self.optimizer.zero_grad()
+                            continue
                     
                     # Apply gradient clipping if needed
                     if self.config.gradient_clip_norm:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.config.gradient_clip_norm
-                        )
+                        # Clip gradients more aggressively for positional embeddings
+                        pos_embed_params = []
+                        other_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None:
+                                if 'pos_embed' in name:
+                                    pos_embed_params.append(param)
+                                else:
+                                    other_params.append(param)
+                        
+                        # Clip positional embeddings more aggressively
+                        if pos_embed_params:
+                            torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
+                        
+                        # Clip other parameters normally
+                        if other_params:
+                            torch.nn.utils.clip_grad_norm_(other_params, self.config.gradient_clip_norm)
+                    else:
+                        # Even without general clipping, clip positional embeddings
+                        pos_embed_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None and 'pos_embed' in name:
+                                pos_embed_params.append(param)
+                        if pos_embed_params:
+                            torch.nn.utils.clip_grad_norm_(pos_embed_params, max_norm=0.1)
                     
                     # Step optimizer
                     self.optimizer.step()
@@ -699,7 +785,7 @@ class SSLTrainer:
             loss_value = loss.item() * self.config.gradient_accumulation_steps
             if not (torch.isnan(torch.tensor(loss_value)) or torch.isinf(torch.tensor(loss_value))):
                 running_loss += loss_value
-                num_batches += 1
+            num_batches += 1
             
             # Update progress bar with additional debug info
             if (batch_idx + 1) % self.config.print_freq == 0:
