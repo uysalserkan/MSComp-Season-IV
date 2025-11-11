@@ -520,12 +520,30 @@ class SSLTrainer:
             # Forward pass with mixed precision
             if self.config.mixed_precision:
                 with autocast(enabled=True):
-                    z0 = self.model(view0)
-                    z1 = self.model(view1)
+                    try:
+                        z0 = self.model(view0)
+                        z1 = self.model(view1)
+                    except ValueError as e:
+                        print(f"Error in model forward pass at batch {batch_idx}, epoch {epoch}: {e}")
+                        print(f"  View0 stats: min={view0.min():.4f}, max={view0.max():.4f}, mean={view0.mean():.4f}")
+                        print(f"  View1 stats: min={view1.min():.4f}, max={view1.max():.4f}, mean={view1.mean():.4f}")
+                        continue
+                    except RuntimeError as e:
+                        print(f"Runtime error in model forward pass at batch {batch_idx}, epoch {epoch}: {e}")
+                        continue
                     
                     # Validate embeddings for NaN/Inf before loss computation
                     if torch.isnan(z0).any() or torch.isinf(z0).any():
                         print(f"Warning: z0 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Embedding stats: min={z0.min():.4f}, max={z0.max():.4f}, mean={z0.mean():.4f}")
+                        # Try to get more diagnostic info
+                        try:
+                            with torch.no_grad():
+                                features0 = self.model.backbone(view0)
+                                proj0 = self.model.projection_head(features0)
+                                print(f"  Backbone features0: min={features0.min():.4f}, max={features0.max():.4f}, mean={features0.mean():.4f}")
+                                print(f"  Projection0 (before norm): min={proj0.min():.4f}, max={proj0.max():.4f}, mean={proj0.mean():.4f}")
+                        except:
+                            pass
                         continue
                     if torch.isnan(z1).any() or torch.isinf(z1).any():
                         print(f"Warning: z1 contains NaN/Inf at batch {batch_idx}, epoch {epoch}. Embedding stats: min={z1.min():.4f}, max={z1.max():.4f}, mean={z1.mean():.4f}")
@@ -558,8 +576,17 @@ class SSLTrainer:
                     
                     loss = loss / self.config.gradient_accumulation_steps
             else:
-                z0 = self.model(view0)
-                z1 = self.model(view1)
+                try:
+                    z0 = self.model(view0)
+                    z1 = self.model(view1)
+                except ValueError as e:
+                    print(f"Error in model forward pass at batch {batch_idx}, epoch {epoch}: {e}")
+                    print(f"  View0 stats: min={view0.min():.4f}, max={view0.max():.4f}, mean={view0.mean():.4f}")
+                    print(f"  View1 stats: min={view1.min():.4f}, max={view1.max():.4f}, mean={view1.mean():.4f}")
+                    continue
+                except RuntimeError as e:
+                    print(f"Runtime error in model forward pass at batch {batch_idx}, epoch {epoch}: {e}")
+                    continue
                 
                 # Validate embeddings for NaN/Inf before loss computation
                 if torch.isnan(z0).any() or torch.isinf(z0).any():

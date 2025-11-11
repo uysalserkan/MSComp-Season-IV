@@ -63,6 +63,22 @@ class ProjectionHead(nn.Module):
         
         self.projection = nn.Sequential(*layers)
     
+    def _initialize_weights(self):
+        """Initialize weights to prevent extreme values that could cause NaN."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Use Xavier/Kaiming initialization with smaller gain
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm1d):
+                # Initialize BatchNorm with stable values
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+                # Initialize running stats to prevent division by zero
+                m.running_mean.zero_()
+                m.running_var.fill_(1.0)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through projection head.
@@ -73,7 +89,23 @@ class ProjectionHead(nn.Module):
         Returns:
             Projected features of shape (batch_size, output_dim).
         """
-        return self.projection(x)
+        # Check input for NaN/Inf
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError(
+                f"Projection head input contains NaN/Inf. Input stats: "
+                f"min={x.min():.4f}, max={x.max():.4f}, mean={x.mean():.4f}"
+            )
+        
+        output = self.projection(x)
+        
+        # Check output for NaN/Inf
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            raise ValueError(
+                f"Projection head output contains NaN/Inf. Output stats: "
+                f"min={output.min():.4f}, max={output.max():.4f}, mean={output.mean():.4f}"
+            )
+        
+        return output
 
 
 class ContrastiveViT(nn.Module):
@@ -135,6 +167,9 @@ class ContrastiveViT(nn.Module):
             use_bias=False,  # No bias for normalized embeddings
         )
         
+        # Initialize projection head weights for stability
+        self.projection_head._initialize_weights()
+        
         # Freeze backbone if requested
         if freeze_backbone:
             self.freeze_backbone()
@@ -167,17 +202,48 @@ class ContrastiveViT(nn.Module):
             If return_features=False: Projected features of shape (batch_size, projection_dim).
             If return_features=True: Tuple of (projected_features, backbone_features).
         """
+        # Validate input
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError("Input contains NaN or Inf values")
+        
         # Extract features from backbone
         features = self.backbone(x)
+        
+        # Check backbone features for NaN/Inf
+        if torch.isnan(features).any() or torch.isinf(features).any():
+            raise ValueError(
+                f"Backbone output contains NaN/Inf. Features stats: "
+                f"min={features.min():.4f}, max={features.max():.4f}, "
+                f"mean={features.mean():.4f}, std={features.std():.4f}"
+            )
         
         # Project to contrastive space
         projection = self.projection_head(features)
         
+        # Check projection output before normalization
+        if torch.isnan(projection).any() or torch.isinf(projection).any():
+            raise ValueError(
+                f"Projection head output contains NaN/Inf before normalization. "
+                f"Projection stats: min={projection.min():.4f}, max={projection.max():.4f}, "
+                f"mean={projection.mean():.4f}, std={projection.std():.4f}"
+            )
+        
         # Normalize projection (important for contrastive learning)
         if normalize:
-            # Add small epsilon to prevent division by zero for zero vectors
-            # This ensures numerical stability during normalization
-            projection = nn.functional.normalize(projection + 1e-8, dim=1)
+            # Compute norm for each sample
+            norms = torch.norm(projection, dim=1, keepdim=True)
+            # Replace zero or very small norms with epsilon to prevent division by zero
+            norms = torch.clamp(norms, min=1e-8)
+            # Normalize
+            projection = projection / norms
+        
+        # Final check after normalization
+        if torch.isnan(projection).any() or torch.isinf(projection).any():
+            raise ValueError(
+                f"Projection contains NaN/Inf after normalization. "
+                f"Final projection stats: min={projection.min():.4f}, max={projection.max():.4f}, "
+                f"mean={projection.mean():.4f}"
+            )
         
         if return_features:
             return projection, features
