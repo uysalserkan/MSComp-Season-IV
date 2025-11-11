@@ -358,7 +358,54 @@ class SSLTrainer:
         if "train_losses" in checkpoint:
             self.train_losses = checkpoint["train_losses"]
         
+        # Load scheduler state if available
+        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            print(f"Loaded scheduler state from checkpoint")
+        
+        # Load scaler state if available and using mixed precision
+        if self.scaler is not None and "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            print(f"Loaded scaler state from checkpoint")
+        
         print(f"Resumed from epoch {self.start_epoch}")
+    
+    def _process_view_tensor(self, view, name: str = "view") -> torch.Tensor:
+        """
+        Process a view tensor to ensure it's a 4D tensor on the correct device.
+        
+        Args:
+            view: Input view (can be tensor, list of tensors, or other)
+            name: Name for error messages
+        
+        Returns:
+            4D tensor (batch_size, channels, height, width) on device
+        """
+        if isinstance(view, torch.Tensor):
+            if view.dim() == 4:
+                return view.to(self.device)
+            elif view.dim() == 3:
+                # Single image, add batch dimension
+                return view.unsqueeze(0).to(self.device)
+            else:
+                raise ValueError(f"{name} has unexpected dimensions: {view.dim()}, shape: {view.shape}. Expected 3D or 4D tensor.")
+        elif isinstance(view, (list, tuple)):
+            if len(view) == 0:
+                raise ValueError(f"{name} is empty list/tuple")
+            # Stack list of tensors
+            if isinstance(view[0], torch.Tensor):
+                return torch.stack(view).to(self.device)
+            else:
+                # Convert to tensors first
+                return torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view])
+        else:
+            # Try to convert to tensor
+            view_tensor = torch.tensor(view).to(self.device)
+            if view_tensor.dim() == 3:
+                view_tensor = view_tensor.unsqueeze(0)
+            elif view_tensor.dim() != 4:
+                raise ValueError(f"{name} cannot be converted to 4D tensor. Shape: {view_tensor.shape}")
+            return view_tensor
     
     def train_epoch(self, epoch: int) -> float:
         """
@@ -384,7 +431,6 @@ class SSLTrainer:
         
         for batch_idx, batch in enumerate(pbar):
             # Get two augmented views from collate function
-            # SimCLRCollateFunction returns (views, labels, filenames) where views is a list
             try:
                 view0 = None
                 view1 = None
@@ -396,150 +442,32 @@ class SSLTrainer:
                         # Lightly format: [views, labels, filenames] or (views, labels, filenames)
                         # views is a list/tuple of tensors, one for each view
                         views = batch[0]
-                        view0 = views[0].to(self.device)
-                        view1 = views[1].to(self.device)
-                        # Validate shapes
-                        if view0.dim() != 4:
-                            raise ValueError(f"view0 from lightly has wrong dimensions: {view0.dim()}, expected 4. Shape: {view0.shape}")
-                        if view1.dim() != 4:
-                            raise ValueError(f"view1 from lightly has wrong dimensions: {view1.dim()}, expected 4. Shape: {view1.shape}")
+                        view0 = views[0]
+                        view1 = views[1]
                 
-                # If not handled as lightly batch, try other formats
+                # If not handled as lightly batch, try custom collate format
                 if view0 is None or view1 is None:
                     if isinstance(batch, (tuple, list)) and len(batch) == 2:
                         # Custom collate format: (view0, view1) or [view0, view1]
-                        view0, view1 = batch[0], batch[1]
-                    
-                    # Ensure they are tensors with correct shape
-                    if view0 is not None and view1 is not None:
-                        if isinstance(view0, torch.Tensor):
-                            if view0.dim() == 4:
-                                view0 = view0.to(self.device)
-                            else:
-                                # If it's a single image (3D), we need to add batch dimension
-                                if view0.dim() == 3:
-                                    view0 = view0.unsqueeze(0).to(self.device)
-                                else:
-                                    raise ValueError(f"view0 has unexpected dimensions: {view0.dim()}, shape: {view0.shape}")
-                    elif isinstance(view0, (list, tuple)):
-                        # Stack list of tensors
-                        if len(view0) > 0 and isinstance(view0[0], torch.Tensor):
-                            view0 = torch.stack(view0).to(self.device)
-                        else:
-                            view0 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view0])
+                        view0 = batch[0]
+                        view1 = batch[1]
                     else:
-                        view0 = torch.tensor(view0).to(self.device)
-                        if view0.dim() == 3:
-                            view0 = view0.unsqueeze(0)
-                    
-                    if isinstance(view1, torch.Tensor):
-                        if view1.dim() == 4:
-                            view1 = view1.to(self.device)
-                        else:
-                            # If it's a single image (3D), we need to add batch dimension
-                            if view1.dim() == 3:
-                                view1 = view1.unsqueeze(0).to(self.device)
-                            else:
-                                raise ValueError(f"view1 has unexpected dimensions: {view1.dim()}, shape: {view1.shape}")
-                    elif isinstance(view1, (list, tuple)):
-                        # Stack list of tensors
-                        if len(view1) > 0 and isinstance(view1[0], torch.Tensor):
-                            view1 = torch.stack(view1).to(self.device)
-                        else:
-                            view1 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view1])
-                    else:
-                        view1 = torch.tensor(view1).to(self.device)
-                        if view1.dim() == 3:
-                            view1 = view1.unsqueeze(0)
-                elif isinstance(batch, (list, tuple)) and len(batch) == 2:
-                    # Batch might be a list/tuple of two views directly (custom collate)
-                    view0_raw = batch[0]
-                    view1_raw = batch[1]
-                    # Convert to tensors if needed
-                    if isinstance(view0_raw, torch.Tensor):
-                        if view0_raw.dim() == 4:
-                            view0 = view0_raw.to(self.device)
-                        elif view0_raw.dim() == 3:
-                            view0 = view0_raw.unsqueeze(0).to(self.device)
-                        else:
-                            raise ValueError(f"view0_raw has unexpected dimensions: {view0_raw.dim()}, shape: {view0_raw.shape}")
-                    elif isinstance(view0_raw, (list, tuple)):
-                        # Stack list of tensors
-                        if len(view0_raw) > 0:
-                            if isinstance(view0_raw[0], torch.Tensor):
-                                view0 = torch.stack(view0_raw).to(self.device)
-                            else:
-                                view0 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view0_raw])
-                        else:
-                            raise ValueError("view0_raw is empty list")
-                    else:
-                        view0 = torch.tensor(view0_raw).to(self.device)
-                        if view0.dim() == 3:
-                            view0 = view0.unsqueeze(0)
-                    
-                    if isinstance(view1_raw, torch.Tensor):
-                        if view1_raw.dim() == 4:
-                            view1 = view1_raw.to(self.device)
-                        elif view1_raw.dim() == 3:
-                            view1 = view1_raw.unsqueeze(0).to(self.device)
-                        else:
-                            raise ValueError(f"view1_raw has unexpected dimensions: {view1_raw.dim()}, shape: {view1_raw.shape}")
-                    elif isinstance(view1_raw, (list, tuple)):
-                        # Stack list of tensors
-                        if len(view1_raw) > 0:
-                            if isinstance(view1_raw[0], torch.Tensor):
-                                view1 = torch.stack(view1_raw).to(self.device)
-                            else:
-                                view1 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view1_raw])
-                        else:
-                            raise ValueError("view1_raw is empty list")
-                    else:
-                        view1 = torch.tensor(view1_raw).to(self.device)
-                        if view1.dim() == 3:
-                            view1 = view1.unsqueeze(0)
-                    # Ensure they are tensors with correct shape
-                    if view0 is not None and view1 is not None:
-                        if isinstance(view0, torch.Tensor):
-                            if view0.dim() == 4:
-                                view0 = view0.to(self.device)
-                            else:
-                                # If it's a single image (3D), we need to add batch dimension
-                                if view0.dim() == 3:
-                                    view0 = view0.unsqueeze(0).to(self.device)
-                                else:
-                                    raise ValueError(f"view0 has unexpected dimensions: {view0.dim()}, shape: {view0.shape}")
-                        elif isinstance(view0, (list, tuple)):
-                            # Stack list of tensors
-                            if len(view0) > 0 and isinstance(view0[0], torch.Tensor):
-                                view0 = torch.stack(view0).to(self.device)
-                            else:
-                                view0 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view0])
-                        else:
-                            view0 = torch.tensor(view0).to(self.device)
-                            if view0.dim() == 3:
-                                view0 = view0.unsqueeze(0)
-                        
-                        if isinstance(view1, torch.Tensor):
-                            if view1.dim() == 4:
-                                view1 = view1.to(self.device)
-                            else:
-                                # If it's a single image (3D), we need to add batch dimension
-                                if view1.dim() == 3:
-                                    view1 = view1.unsqueeze(0).to(self.device)
-                                else:
-                                    raise ValueError(f"view1 has unexpected dimensions: {view1.dim()}, shape: {view1.shape}")
-                        elif isinstance(view1, (list, tuple)):
-                            # Stack list of tensors
-                            if len(view1) > 0 and isinstance(view1[0], torch.Tensor):
-                                view1 = torch.stack(view1).to(self.device)
-                            else:
-                                view1 = torch.stack([torch.tensor(img).to(self.device) if not isinstance(img, torch.Tensor) else img.to(self.device) for img in view1])
-                        else:
-                            view1 = torch.tensor(view1).to(self.device)
-                            if view1.dim() == 3:
-                                view1 = view1.unsqueeze(0)
-                    else:
-                        raise ValueError(f"Could not extract views from batch. Batch type: {type(batch)}, length: {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+                        raise ValueError(
+                            f"Unrecognized batch format. Batch type: {type(batch)}, "
+                            f"length: {len(batch) if hasattr(batch, '__len__') else 'N/A'}. "
+                            f"Expected lightly format [views, labels, filenames] or custom format (view0, view1)."
+                        )
+                
+                # Process both views to ensure they're 4D tensors
+                view0 = self._process_view_tensor(view0, "view0")
+                view1 = self._process_view_tensor(view1, "view1")
+                
+                # Final validation
+                if view0.dim() != 4:
+                    raise ValueError(f"view0 has wrong number of dimensions: {view0.dim()}, expected 4. Shape: {view0.shape}")
+                if view1.dim() != 4:
+                    raise ValueError(f"view1 has wrong number of dimensions: {view1.dim()}, expected 4. Shape: {view1.shape}")
+                
             except Exception as e:
                 print(f"\nError processing batch at index {batch_idx}: {e}")
                 print(f"Batch type: {type(batch)}")
@@ -556,12 +484,6 @@ class SSLTrainer:
                 raise
             
             # Forward pass with mixed precision
-            # Validate tensor shapes before passing to model
-            if view0.dim() != 4:
-                raise ValueError(f"view0 has wrong number of dimensions: {view0.dim()}, expected 4. Shape: {view0.shape}")
-            if view1.dim() != 4:
-                raise ValueError(f"view1 has wrong number of dimensions: {view1.dim()}, expected 4. Shape: {view1.shape}")
-            
             if self.config.mixed_precision:
                 with autocast():
                     z0 = self.model(view0)
@@ -597,7 +519,11 @@ class SSLTrainer:
                 loss.backward()
             
             # Update weights (with gradient accumulation)
-            if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+            # Check if we should update weights (either at accumulation step or at end of epoch)
+            should_update = (batch_idx + 1) % self.config.gradient_accumulation_steps == 0
+            is_last_batch = (batch_idx + 1) == len(self.train_loader)
+            
+            if should_update or is_last_batch:
                 if self.config.mixed_precision:
                     if self.config.gradient_clip_norm:
                         self.scaler.unscale_(self.optimizer)
@@ -627,6 +553,10 @@ class SSLTrainer:
                     'loss': f'{running_loss/num_batches:.4f}',
                     'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
                 })
+        
+        # Defensive check for empty batches
+        if num_batches == 0:
+            raise RuntimeError("No batches were processed in this epoch. Check your data loader configuration.")
         
         avg_loss = running_loss / num_batches
         
@@ -683,6 +613,14 @@ class SSLTrainer:
                 "config": self.config.to_dict()
             }
             
+            # Save scheduler state if available
+            if self.scheduler is not None:
+                checkpoint_state["scheduler_state_dict"] = self.scheduler.state_dict()
+            
+            # Save scaler state if using mixed precision
+            if self.scaler is not None:
+                checkpoint_state["scaler_state_dict"] = self.scaler.state_dict()
+            
             checkpoint_path = Path(self.config.checkpoint_dir) / f"ssl_checkpoint_epoch_{epoch+1}.pth"
             save_checkpoint(
                 checkpoint_state,
@@ -711,6 +649,10 @@ def parse_args():
                         help="Projection head output dimension")
     parser.add_argument("--projection_hidden_dim", type=int, default=2048,
                         help="Projection head hidden dimension")
+    parser.add_argument("--projection_num_layers", type=int, default=3,
+                        help="Number of layers in projection head")
+    parser.add_argument("--freeze_backbone", action="store_true", default=False,
+                        help="Freeze backbone layers")
     
     # Method
     parser.add_argument("--method", type=str, default="simclr",
@@ -728,6 +670,10 @@ def parse_args():
                         help="Number of data loading workers")
     parser.add_argument("--image_size", type=int, default=224,
                         help="Input image size")
+    parser.add_argument("--use_strong_augmentation", action="store_true", default=True,
+                        help="Use strong data augmentation for contrastive learning")
+    parser.add_argument("--pin_memory", action="store_true", default=True,
+                        help="Pin memory for faster GPU transfer")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=100,
@@ -738,6 +684,13 @@ def parse_args():
                         help="Weight decay")
     parser.add_argument("--warmup_epochs", type=int, default=10,
                         help="Learning rate warmup epochs")
+    
+    # Learning rate scheduling
+    parser.add_argument("--lr_scheduler", type=str, default="cosine",
+                        choices=["cosine", "step", "none"],
+                        help="Learning rate scheduler (cosine, step, or none)")
+    parser.add_argument("--lr_min", type=float, default=1e-6,
+                        help="Minimum learning rate")
     
     # Training settings
     parser.add_argument("--mixed_precision", action="store_true", default=True,
@@ -758,6 +711,14 @@ def parse_args():
     # Reproducibility
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--deterministic", action="store_true", default=True,
+                        help="Use deterministic algorithms")
+    
+    # Logging
+    parser.add_argument("--print_freq", type=int, default=10,
+                        help="Print metrics every N batches")
+    parser.add_argument("--save_freq", type=int, default=10,
+                        help="Save checkpoint every N epochs")
     
     return parser.parse_args()
 
@@ -767,28 +728,40 @@ def main():
     args = parse_args()
     
     # Create config from arguments
+    # Convert "none" to None for lr_scheduler
+    lr_scheduler = args.lr_scheduler if args.lr_scheduler != "none" else None
+    
     config = SSLConfig(
         backbone_name=args.backbone_name,
         pretrained=args.pretrained,
         projection_dim=args.projection_dim,
         projection_hidden_dim=args.projection_hidden_dim,
+        projection_num_layers=args.projection_num_layers,
+        freeze_backbone=args.freeze_backbone,
         method=args.method,
         temperature=args.temperature,
         data_root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
         image_size=args.image_size,
+        use_strong_augmentation=args.use_strong_augmentation,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs,
+        lr_scheduler=lr_scheduler,
+        lr_min=args.lr_min,
         mixed_precision=args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_clip_norm=args.gradient_clip_norm,
         checkpoint_dir=args.checkpoint_dir,
         log_dir=args.log_dir,
         resume_from=args.resume_from,
-        seed=args.seed
+        seed=args.seed,
+        deterministic=args.deterministic,
+        print_freq=args.print_freq,
+        save_freq=args.save_freq
     )
     
     # Create trainer and start training
