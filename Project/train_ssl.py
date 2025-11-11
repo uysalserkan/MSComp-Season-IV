@@ -6,6 +6,7 @@ for best practices and proven implementations.
 """
 
 import argparse
+import math
 import time
 from pathlib import Path
 from typing import Optional
@@ -143,6 +144,13 @@ class SSLTrainer:
             freeze_backbone=config.freeze_backbone
         ).to(self.device)
         
+        # Progressive unfreezing strategy for numerical stability
+        # Freeze the most problematic layers for the first few epochs
+        self.model.freeze_patch_embed()
+        self.model.freeze_pos_embed()
+        self.model.freeze_early_blocks(num_blocks=2)
+        self.unfreeze_epoch = 5  # Unfreeze after this many epochs
+        
         # Print model summary
         print("\n" + "="*50)
         print("SSL Model Summary")
@@ -151,6 +159,9 @@ class SSLTrainer:
         print(f"Total parameters: {param_counts['total']:,}")
         print(f"Trainable parameters: {param_counts['trainable']:,}")
         print(f"Method: {config.method.upper()}")
+        print(f"\nProgressive Unfreezing Strategy:")
+        print(f"  - Patch embed, pos embed, and first 2 blocks frozen until epoch {self.unfreeze_epoch}")
+        print(f"  - This prevents NaN gradients during early training")
         print("="*50 + "\n")
         
         # Initialize dataset loader
@@ -347,29 +358,44 @@ class SSLTrainer:
             self._load_checkpoint(config.resume_from)
     
     def _get_scheduler(self):
-        """Get learning rate scheduler with warmup."""
-        if self.config.lr_scheduler == "cosine":
-            # Cosine annealing after warmup
-            # Initialize with last_epoch=-1 so scheduler doesn't step during warmup
-            # We'll manually step it starting from warmup_epochs
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.config.epochs - self.config.warmup_epochs,
-                eta_min=self.config.lr_min,
-                last_epoch=-1  # Start from -1 so it doesn't step during warmup
-            )
-            return scheduler
-        elif self.config.lr_scheduler == "step":
-            # StepLR also needs to account for warmup
-            scheduler = optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=self.config.epochs // 3,
-                gamma=0.1,
-                last_epoch=-1  # Start from -1 so it doesn't step during warmup
-            )
-            return scheduler
-        else:
+        """
+        Get learning rate scheduler with warmup.
+        
+        For discriminative learning rates, we need to maintain the LR ratios
+        between parameter groups. Standard PyTorch schedulers don't do this,
+        so we implement custom scheduling logic.
+        """
+        # With discriminative learning rates, we'll apply scheduling manually
+        # to maintain the LR ratios between groups
+        # Store the LR ratios for later use
+        if len(self.optimizer.param_groups) > 1:
+            # Calculate LR ratios relative to the first (highest) base LR
+            base_lrs = [group['initial_lr'] for group in self.optimizer.param_groups]
+            max_base_lr = max(base_lrs)
+            self.lr_ratios = [lr / max_base_lr for lr in base_lrs]
+            self.max_base_lr = max_base_lr
+            # Don't use standard scheduler with discriminative LRs
             return None
+        else:
+            # Standard scheduler for single LR
+            if self.config.lr_scheduler == "cosine":
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=self.config.epochs - self.config.warmup_epochs,
+                    eta_min=self.config.lr_min,
+                    last_epoch=-1
+                )
+                return scheduler
+            elif self.config.lr_scheduler == "step":
+                scheduler = optim.lr_scheduler.StepLR(
+                    self.optimizer,
+                    step_size=self.config.epochs // 3,
+                    gamma=0.1,
+                    last_epoch=-1
+                )
+                return scheduler
+            else:
+                return None
     
     def _get_warmup_lr(self, epoch: int) -> dict:
         """
@@ -476,6 +502,29 @@ class SSLTrainer:
         self.model.train()
         running_loss = 0.0
         num_batches = 0
+        
+        # Progressive unfreezing: unfreeze problematic layers after initial epochs
+        if epoch == self.unfreeze_epoch:
+            print(f"\nEpoch {epoch+1}: Unfreezing patch_embed, pos_embed, and early blocks...")
+            self.model.unfreeze_patch_embed()
+            self.model.unfreeze_pos_embed()
+            self.model.unfreeze_early_blocks()
+            # Rebuild param groups with newly unfrozen parameters
+            param_groups = self.model.get_param_groups(
+                base_lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay
+            )
+            # Update optimizer param groups
+            self.optimizer.param_groups = param_groups
+            # Store initial LR for each param group
+            for param_group in self.optimizer.param_groups:
+                param_group['initial_lr'] = param_group['lr']
+            # Recalculate LR ratios
+            base_lrs = [group['initial_lr'] for group in self.optimizer.param_groups]
+            max_base_lr = max(base_lrs)
+            self.lr_ratios = [lr / max_base_lr for lr in base_lrs]
+            self.max_base_lr = max_base_lr
+            print("Optimizer updated with new parameter groups\n")
         
         # Set learning rate with warmup (handles multiple param groups with different base LRs)
         if epoch < self.config.warmup_epochs:
@@ -883,12 +932,39 @@ class SSLTrainer:
             print(f"Warning: Average loss is NaN/Inf at epoch {epoch}. This may indicate training instability.")
         
         # Update learning rate scheduler (after warmup)
-        if self.scheduler and epoch >= self.config.warmup_epochs:
-            self.scheduler.step()
-            # Log LR after scheduler step for debugging
-            current_lr = self.optimizer.param_groups[0]["lr"]
-            if (epoch + 1) % 5 == 0:  # Log every 5 epochs
-                print(f"  Scheduler LR: {current_lr:.8f}")
+        if epoch >= self.config.warmup_epochs:
+            if self.scheduler is not None:
+                # Standard scheduler (single param group)
+                self.scheduler.step()
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                if (epoch + 1) % 5 == 0:  # Log every 5 epochs
+                    print(f"  Scheduler LR: {current_lr:.8f}")
+            elif hasattr(self, 'lr_ratios'):
+                # Custom scheduling for discriminative LRs
+                # Apply cosine annealing to max LR, then scale other groups by their ratios
+                if self.config.lr_scheduler == "cosine":
+                    # Cosine annealing
+                    epochs_since_warmup = epoch - self.config.warmup_epochs
+                    T_max = self.config.epochs - self.config.warmup_epochs
+                    current_max_lr = self.config.lr_min + (self.max_base_lr - self.config.lr_min) * \
+                                     0.5 * (1 + math.cos(epochs_since_warmup / T_max * math.pi))
+                    
+                    # Apply to all param groups with their ratios
+                    for i, param_group in enumerate(self.optimizer.param_groups):
+                        param_group['lr'] = current_max_lr * self.lr_ratios[i]
+                    
+                    if (epoch + 1) % 5 == 0:  # Log every 5 epochs
+                        print(f"  Max LR: {current_max_lr:.8f}")
+                        for i, group in enumerate(self.optimizer.param_groups):
+                            print(f"    {group.get('name', f'group_{i}')}: {group['lr']:.8f}")
+                elif self.config.lr_scheduler == "step":
+                    # Step decay
+                    decay_epochs = (epoch - self.config.warmup_epochs) // (self.config.epochs // 3)
+                    current_max_lr = self.max_base_lr * (0.1 ** decay_epochs)
+                    
+                    # Apply to all param groups with their ratios
+                    for i, param_group in enumerate(self.optimizer.param_groups):
+                        param_group['lr'] = current_max_lr * self.lr_ratios[i]
         
         return avg_loss
     

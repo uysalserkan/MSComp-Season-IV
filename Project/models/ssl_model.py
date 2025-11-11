@@ -213,6 +213,44 @@ class ContrastiveViT(nn.Module):
                 param.requires_grad = True
                 self._freeze_pos_embed = False
     
+    def freeze_patch_embed(self) -> None:
+        """Freeze patch embedding layer to prevent NaN issues during early training."""
+        for name, param in self.backbone.named_parameters():
+            if 'patch_embed' in name:
+                param.requires_grad = False
+        print("Patch embedding frozen for stable early training")
+    
+    def unfreeze_patch_embed(self) -> None:
+        """Unfreeze patch embedding layer."""
+        for name, param in self.backbone.named_parameters():
+            if 'patch_embed' in name:
+                param.requires_grad = True
+        print("Patch embedding unfrozen")
+    
+    def freeze_early_blocks(self, num_blocks: int = 2) -> None:
+        """
+        Freeze first N transformer blocks to prevent NaN issues.
+        
+        Args:
+            num_blocks: Number of early blocks to freeze (default: 2)
+        """
+        for name, param in self.backbone.named_parameters():
+            if 'blocks' in name:
+                try:
+                    block_num = int(name.split('blocks.')[1].split('.')[0])
+                    if block_num < num_blocks:
+                        param.requires_grad = False
+                except (IndexError, ValueError):
+                    pass
+        print(f"First {num_blocks} transformer blocks frozen for stable early training")
+    
+    def unfreeze_early_blocks(self) -> None:
+        """Unfreeze all transformer blocks."""
+        for name, param in self.backbone.named_parameters():
+            if 'blocks' in name:
+                param.requires_grad = True
+        print("All transformer blocks unfrozen")
+    
     def freeze_backbone(self) -> None:
         """Freeze all backbone parameters."""
         for param in self.backbone.parameters():
