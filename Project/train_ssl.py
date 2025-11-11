@@ -645,7 +645,7 @@ class SSLTrainer:
                 
                 if self.config.mixed_precision:
                     # Unscale gradients (required before clipping and checking)
-                        self.scaler.unscale_(self.optimizer)
+                    self.scaler.unscale_(self.optimizer)
                     
                     # Check for NaN/Inf gradients
                     for name, param in self.model.named_parameters():
@@ -813,11 +813,11 @@ class SSLTrainer:
                 
                 self.optimizer.zero_grad()
             
-            # Accumulate loss
+            # Accumulate loss (only if we successfully processed the batch)
             loss_value = loss.item() * self.config.gradient_accumulation_steps
             if not (torch.isnan(torch.tensor(loss_value)) or torch.isinf(torch.tensor(loss_value))):
                 running_loss += loss_value
-            num_batches += 1
+                num_batches += 1
             
             # Update progress bar with additional debug info
             if (batch_idx + 1) % self.config.print_freq == 0:
