@@ -581,8 +581,8 @@ class SSLTrainer:
                     loss = loss / self.config.gradient_accumulation_steps
             else:
                 try:
-                z0 = self.model(view0)
-                z1 = self.model(view1)
+                    z0 = self.model(view0)
+                    z1 = self.model(view1)
                 except ValueError as e:
                     print(f"Error in model forward pass at batch {batch_idx}, epoch {epoch}: {e}")
                     print(f"  View0 stats: min={view0.min():.4f}, max={view0.max():.4f}, mean={view0.mean():.4f}")
@@ -608,12 +608,12 @@ class SSLTrainer:
                     continue
                 
                 try:
-                if LIGHTLY_AVAILABLE and self.config.method == "simclr":
-                    # Lightly NTXentLoss expects two separate arguments: out0, out1
-                    loss = self.criterion(z0, z1)
-                else:
-                    # Custom loss expects two separate tensors
-                    loss = self.criterion(z0, z1)
+                    if LIGHTLY_AVAILABLE and self.config.method == "simclr":
+                        # Lightly NTXentLoss expects two separate arguments: out0, out1
+                        loss = self.criterion(z0, z1)
+                    else:
+                        # Custom loss expects two separate tensors
+                        loss = self.criterion(z0, z1)
                 except (ValueError, RuntimeError) as e:
                     print(f"Error computing loss at batch {batch_idx}, epoch {epoch}: {e}")
                     continue
