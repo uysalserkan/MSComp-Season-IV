@@ -607,42 +607,63 @@ class SSLTrainer:
             
             if should_update or is_last_batch:
                 # Check gradients for NaN/Inf before updating
+                # For mixed precision, we need to unscale first to check properly
+                # But we must ensure scaler state is handled correctly
                 has_nan_grad = False
+                
                 if self.config.mixed_precision:
+                    # Unscale gradients (required before clipping and checking)
                     self.scaler.unscale_(self.optimizer)
+                    
+                    # Check for NaN/Inf gradients
                     for name, param in self.model.named_parameters():
                         if param.grad is not None:
                             if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                                 print(f"Warning: NaN/Inf gradient detected in {name} at batch {batch_idx}, epoch {epoch}")
                                 has_nan_grad = True
                                 break
-                else:
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None:
-                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                print(f"Warning: NaN/Inf gradient detected in {name} at batch {batch_idx}, epoch {epoch}")
-                                has_nan_grad = True
-                                break
-                
-                if has_nan_grad:
-                    # Skip this update, zero gradients, and continue
-                    self.optimizer.zero_grad()
-                    continue
-                
-                if self.config.mixed_precision:
+                    
+                    if has_nan_grad:
+                        # Skip this update, zero gradients, and reset scaler state
+                        # We need to call update() to reset scaler state even though we're skipping
+                        self.optimizer.zero_grad()
+                        # Reset scaler by calling update() without stepping
+                        # This resets the scaler's internal state
+                        self.scaler.update()
+                        continue
+                    
+                    # Apply gradient clipping if needed
                     if self.config.gradient_clip_norm:
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.config.gradient_clip_norm
                         )
+                    
+                    # Step optimizer and update scaler
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
+                    # Non-mixed precision: check gradients directly
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"Warning: NaN/Inf gradient detected in {name} at batch {batch_idx}, epoch {epoch}")
+                                has_nan_grad = True
+                                break
+                    
+                    if has_nan_grad:
+                        # Skip this update, zero gradients
+                        self.optimizer.zero_grad()
+                        continue
+                    
+                    # Apply gradient clipping if needed
                     if self.config.gradient_clip_norm:
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.config.gradient_clip_norm
                         )
+                    
+                    # Step optimizer
                     self.optimizer.step()
                 
                 self.optimizer.zero_grad()
