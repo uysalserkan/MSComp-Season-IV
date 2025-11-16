@@ -271,15 +271,18 @@ class SSLTrainer:
             download=True
         )
         
-        # Get contrastive data loader for unlabeled data
-        # Note: SimCLRTransform will be applied via collate function
-        self.train_loader = self.dataset_loader.get_contrastive_data_loader(
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-            image_size=config.image_size,
-            use_strong_augmentation=config.use_strong_augmentation,
-            pin_memory=config.pin_memory,
-            split="unlabeled"  # Use unlabeled data for SSL
+        # Load unlabeled dataset without transforms (will apply SimCLR transform in collate_fn)
+        # We need the raw dataset to apply SimCLRTransform which expects PIL images
+        from torchvision import transforms as T
+        
+        # Minimal transform to keep images as PIL (no tensor conversion yet)
+        identity_transform = T.Compose([
+            T.Resize((config.image_size, config.image_size)),
+        ])
+        
+        self.train_dataset = self.dataset_loader.get_unlabeled_dataset(
+            transform=identity_transform,
+            download=True
         )
         
         # Setup SimCLR transform for two views
@@ -322,8 +325,8 @@ class SSLTrainer:
         if config.resume_from:
             self._load_checkpoint(config.resume_from)
         
-        print(f"Training on {len(self.train_loader.dataset)} unlabeled images")
-        print(f"Batch size: {config.batch_size}, Batches per epoch: {len(self.train_loader)}\n")
+        print(f"Training on {len(self.train_dataset)} unlabeled images")
+        print(f"Batch size: {config.batch_size}\n")
     
     def _get_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
         """
@@ -397,24 +400,19 @@ class SSLTrainer:
         Returns:
             Tuple of (images_view1, images_view2, labels).
         """
-        images = []
+        view1 = []
+        view2 = []
         labels = []
         
         for img, label in batch:
-            images.append(img)
-            labels.append(label)
-        
-        # Apply SimCLR transform to create two views
-        # Note: SimCLRTransform expects PIL images or tensors
-        view1 = []
-        view2 = []
-        
-        for img in images:
-            # Apply transform twice to get two different augmented views
+            # Apply SimCLR transform to get two different augmented views
+            # SimCLRTransform returns two views automatically
             v1, v2 = self.simclr_transform(img)
             view1.append(v1)
             view2.append(v2)
+            labels.append(label)
         
+        # Stack into batches
         view1 = torch.stack(view1)
         view2 = torch.stack(view2)
         labels = torch.tensor(labels)
@@ -435,9 +433,9 @@ class SSLTrainer:
         running_loss = 0.0
         num_batches = 0
         
-        # Update data loader with custom collate function
+        # Create data loader with custom collate function for SimCLR transforms
         train_loader = torch.utils.data.DataLoader(
-            self.train_loader.dataset,
+            self.train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
@@ -513,6 +511,14 @@ class SSLTrainer:
                     'loss': f'{running_loss/num_batches:.4f}',
                     'lr': f'{self.optimizer.param_groups[-1]["lr"]:.6f}'
                 })
+        
+        # Check if any batches were processed
+        if num_batches == 0:
+            raise RuntimeError(
+                "No batches were processed in this epoch. "
+                "This might indicate a data loading issue. "
+                f"Dataset size: {len(self.train_dataset)}, Batch size: {self.config.batch_size}"
+            )
         
         avg_loss = running_loss / num_batches
         return avg_loss
