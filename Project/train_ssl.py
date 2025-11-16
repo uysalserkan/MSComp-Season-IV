@@ -443,6 +443,7 @@ class SSLTrainer:
         running_loss = 0.0
         num_batches = 0
         skipped_batches = 0
+        forward_errors = 0
         
         pbar = tqdm(
             self.train_loader,
@@ -454,20 +455,26 @@ class SSLTrainer:
             view2 = view2.to(self.device)
             
             # Forward pass with mixed precision
-            if self.config.mixed_precision:
-                with autocast():
-                    # Get projections for both views
+            try:
+                if self.config.mixed_precision:
+                    with autocast():
+                        proj1 = self.model(view1)
+                        proj2 = self.model(view2)
+                        loss = self.criterion(proj1, proj2)
+                        loss = loss / self.config.gradient_accumulation_steps
+                else:
                     proj1 = self.model(view1)
                     proj2 = self.model(view2)
-                    
-                    # Contrastive loss
                     loss = self.criterion(proj1, proj2)
                     loss = loss / self.config.gradient_accumulation_steps
-            else:
-                proj1 = self.model(view1)
-                proj2 = self.model(view2)
-                loss = self.criterion(proj1, proj2)
-                loss = loss / self.config.gradient_accumulation_steps
+            except ValueError as err:
+                forward_errors += 1
+                print(
+                    f"\nWarning: Model forward failed at batch {batch_idx + 1} "
+                    f"due to numerical instability: {err}. Skipping this batch."
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
             
             # Check for NaN/Inf
             if torch.isnan(loss) or torch.isinf(loss):
@@ -525,9 +532,10 @@ class SSLTrainer:
                 f"Train loader length: {len(self.train_loader)}"
             )
         
-        if skipped_batches > 0:
+        if skipped_batches > 0 or forward_errors > 0:
             print(
-                f"Epoch {epoch+1}: Skipped {skipped_batches} batches due to invalid losses."
+                f"Epoch {epoch+1}: Skipped {skipped_batches} batches due to invalid losses "
+                f"and {forward_errors} batches due to NaN/Inf features."
             )
         
         avg_loss = running_loss / num_batches
