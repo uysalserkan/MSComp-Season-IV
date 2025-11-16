@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 # Lightly imports for SimCLR
@@ -43,7 +44,6 @@ from utils import (
     format_time,
     count_parameters
 )
-from torch.utils.data import Dataset
 class ContrastiveSTL10Dataset(Dataset):
     """
     Dataset wrapper that generates SimCLR views from STL-10 images.
@@ -329,12 +329,8 @@ class SSLTrainer:
             base_dataset=base_dataset,
             transform=self.simclr_transform
         )
-        self.train_loader = torch.utils.data.DataLoader(
-            self.train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
+        self.train_loader = self._create_dataloader(
+            batch_size=self.current_batch_size,
             drop_last=True
         )
         
@@ -359,13 +355,15 @@ class SSLTrainer:
         self.best_linear_acc = 0.0
         self.ssl_losses = []
         self.linear_accs = []
+        self.small_batch_mode = False
+        self.current_batch_size = config.batch_size
         
         # Resume from checkpoint if specified
         if config.resume_from:
             self._load_checkpoint(config.resume_from)
         
         print(f"Training on {len(self.train_dataset)} unlabeled images")
-        print(f"Batch size: {config.batch_size}\n")
+        print(f"Initial batch size: {self.current_batch_size}\n")
     
     def _get_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
         """
@@ -400,6 +398,30 @@ class SSLTrainer:
             )
         else:
             return None
+
+    def _create_dataloader(
+        self,
+        batch_size: int,
+        drop_last: bool = True
+    ) -> torch.utils.data.DataLoader:
+        """
+        Build a dataloader for the current contrastive dataset.
+
+        Args:
+            batch_size: Batch size to use.
+            drop_last: Whether to drop the last incomplete batch.
+
+        Returns:
+            Configured DataLoader instance.
+        """
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory,
+            drop_last=drop_last
+        )
     
     def _load_checkpoint(self, checkpoint_path: str) -> None:
         """
@@ -429,27 +451,35 @@ class SSLTrainer:
         print(f"Resumed training from epoch {self.start_epoch}")
         print(f"Best linear evaluation accuracy so far: {self.best_linear_acc:.2f}%\n")
     
-    def train_epoch(self, epoch: int) -> float:
+    def _iterate_batches(
+        self,
+        loader: torch.utils.data.DataLoader,
+        epoch: int,
+        retry: bool = False
+    ) -> Tuple[float, int, int, int]:
         """
-        Train for one epoch using contrastive learning.
-        
+        Run a full pass over the provided dataloader.
+
         Args:
+            loader: DataLoader to iterate.
             epoch: Current epoch number.
-        
+            retry: Whether this pass is a retry with adjusted settings.
+
         Returns:
-            Average contrastive loss for the epoch.
+            Tuple of (average_loss, processed_batches, skipped_batches, forward_errors).
         """
         self.model.train()
         running_loss = 0.0
         num_batches = 0
         skipped_batches = 0
         forward_errors = 0
-        
+
+        desc_suffix = " [Retry]" if retry else ""
         pbar = tqdm(
-            self.train_loader,
-            desc=f"Epoch {epoch+1}/{self.config.epochs} [SSL Train]"
+            loader,
+            desc=f"Epoch {epoch+1}/{self.config.epochs} [SSL Train{desc_suffix}]"
         )
-        
+
         for batch_idx, (view1, view2, _) in enumerate(pbar):
             view1 = view1.to(self.device)
             view2 = view2.to(self.device)
@@ -523,22 +553,60 @@ class SSLTrainer:
                     'lr': f'{self.optimizer.param_groups[-1]["lr"]:.6f}'
                 })
         
-        # Check if any batches were processed
-        if num_batches == 0:
-            raise RuntimeError(
-                "No batches were processed in this epoch. "
-                "This might indicate a data loading issue. "
-                f"Dataset size: {len(self.train_dataset)}, Batch size: {self.config.batch_size}, "
-                f"Train loader length: {len(self.train_loader)}"
-            )
-        
         if skipped_batches > 0 or forward_errors > 0:
             print(
-                f"Epoch {epoch+1}: Skipped {skipped_batches} batches due to invalid losses "
+                f"Epoch {epoch+1}{' (retry)' if retry else ''}: "
+                f"Skipped {skipped_batches} batches due to invalid losses "
                 f"and {forward_errors} batches due to NaN/Inf features."
             )
+
+        avg_loss = running_loss / num_batches if num_batches > 0 else float('nan')
+        return avg_loss, num_batches, skipped_batches, forward_errors
+
+    def train_epoch(self, epoch: int) -> float:
+        """
+        Train for one epoch using contrastive learning.
         
-        avg_loss = running_loss / num_batches
+        Args:
+            epoch: Current epoch number.
+        
+        Returns:
+            Average contrastive loss for the epoch.
+        """
+        avg_loss, num_batches, _, _ = self._iterate_batches(
+            loader=self.train_loader,
+            epoch=epoch,
+            retry=False
+        )
+
+        if num_batches == 0:
+            # Attempt a recovery by reducing batch size and disabling drop_last
+            if not self.small_batch_mode:
+                self.small_batch_mode = True
+                self.current_batch_size = max(32, self.current_batch_size // 2)
+                print(
+                    f"\nNo batches processed in epoch {epoch+1}. "
+                    f"Retrying with smaller batch size ({self.current_batch_size}) "
+                    "and drop_last=False for stability.\n"
+                )
+                self.train_loader = self._create_dataloader(
+                    batch_size=self.current_batch_size,
+                    drop_last=False
+                )
+                avg_loss, num_batches, _, _ = self._iterate_batches(
+                    loader=self.train_loader,
+                    epoch=epoch,
+                    retry=True
+                )
+
+        if num_batches == 0:
+            raise RuntimeError(
+                "No batches were processed in this epoch despite automatic recovery attempts. "
+                "This indicates persistent numerical instability. "
+                "Please try reducing --learning_rate, disabling --mixed_precision, or "
+                "freezing early ViT layers using ssl_model utilities."
+            )
+        
         return avg_loss
     
     def linear_evaluation(self, epoch: int) -> float:
