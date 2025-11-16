@@ -43,6 +43,35 @@ from utils import (
     format_time,
     count_parameters
 )
+from torch.utils.data import Dataset
+class ContrastiveSTL10Dataset(Dataset):
+    """
+    Dataset wrapper that generates SimCLR views from STL-10 images.
+
+    This ensures augmented pairs are created within __getitem__, allowing the
+    default PyTorch collate function to stack tensors without custom logic.
+    """
+
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        transform: SimCLRTransform
+    ) -> None:
+        """
+        Args:
+            base_dataset: STL-10 dataset returning PIL images.
+            transform: SimCLRTransform that produces two augmented views.
+        """
+        self.base_dataset = base_dataset
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        image, label = self.base_dataset[index]
+        view1, view2 = self.transform(image)
+        return view1, view2, label
 
 
 class LinearEvaluator:
@@ -271,20 +300,6 @@ class SSLTrainer:
             download=True
         )
         
-        # Load unlabeled dataset without transforms (will apply SimCLR transform in collate_fn)
-        # We need the raw dataset to apply SimCLRTransform which expects PIL images
-        from torchvision import transforms as T
-        
-        # Minimal transform to keep images as PIL (no tensor conversion yet)
-        identity_transform = T.Compose([
-            T.Resize((config.image_size, config.image_size)),
-        ])
-        
-        self.train_dataset = self.dataset_loader.get_unlabeled_dataset(
-            transform=identity_transform,
-            download=True
-        )
-        
         # Setup SimCLR transform for two views
         self.simclr_transform = SimCLRTransform(
             input_size=config.image_size,
@@ -297,6 +312,30 @@ class SSLTrainer:
                 "mean": [0.485, 0.456, 0.406],
                 "std": [0.229, 0.224, 0.225]
             }
+        )
+
+        # Load unlabeled dataset without tensor conversion (keep PIL for SimCLR)
+        from torchvision import transforms as T
+
+        pil_preserving_transform = T.Resize((config.image_size, config.image_size))
+
+        base_dataset = self.dataset_loader.get_unlabeled_dataset(
+            transform=pil_preserving_transform,
+            download=True
+        )
+
+        # Wrap dataset to generate contrastive pairs directly
+        self.train_dataset = ContrastiveSTL10Dataset(
+            base_dataset=base_dataset,
+            transform=self.simclr_transform
+        )
+        self.train_loader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            drop_last=True
         )
         
         # Contrastive loss (NT-Xent loss)
@@ -390,35 +429,6 @@ class SSLTrainer:
         print(f"Resumed training from epoch {self.start_epoch}")
         print(f"Best linear evaluation accuracy so far: {self.best_linear_acc:.2f}%\n")
     
-    def _collate_fn(self, batch):
-        """
-        Custom collate function to apply SimCLR transforms.
-        
-        Args:
-            batch: List of (image, label) tuples from dataset.
-        
-        Returns:
-            Tuple of (images_view1, images_view2, labels).
-        """
-        view1 = []
-        view2 = []
-        labels = []
-        
-        for img, label in batch:
-            # Apply SimCLR transform to get two different augmented views
-            # SimCLRTransform returns two views automatically
-            v1, v2 = self.simclr_transform(img)
-            view1.append(v1)
-            view2.append(v2)
-            labels.append(label)
-        
-        # Stack into batches
-        view1 = torch.stack(view1)
-        view2 = torch.stack(view2)
-        labels = torch.tensor(labels)
-        
-        return view1, view2, labels
-    
     def train_epoch(self, epoch: int) -> float:
         """
         Train for one epoch using contrastive learning.
@@ -432,20 +442,10 @@ class SSLTrainer:
         self.model.train()
         running_loss = 0.0
         num_batches = 0
-        
-        # Create data loader with custom collate function for SimCLR transforms
-        train_loader = torch.utils.data.DataLoader(
-            self.train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            drop_last=True,
-            collate_fn=self._collate_fn
-        )
+        skipped_batches = 0
         
         pbar = tqdm(
-            train_loader,
+            self.train_loader,
             desc=f"Epoch {epoch+1}/{self.config.epochs} [SSL Train]"
         )
         
@@ -471,7 +471,11 @@ class SSLTrainer:
             
             # Check for NaN/Inf
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nWarning: Loss is {loss.item()}, skipping batch")
+                skipped_batches += 1
+                print(
+                    f"\nWarning: Invalid loss detected at batch {batch_idx + 1}. "
+                    "Skipping this batch to maintain training stability."
+                )
                 continue
             
             # Backward pass
@@ -517,7 +521,13 @@ class SSLTrainer:
             raise RuntimeError(
                 "No batches were processed in this epoch. "
                 "This might indicate a data loading issue. "
-                f"Dataset size: {len(self.train_dataset)}, Batch size: {self.config.batch_size}"
+                f"Dataset size: {len(self.train_dataset)}, Batch size: {self.config.batch_size}, "
+                f"Train loader length: {len(self.train_loader)}"
+            )
+        
+        if skipped_batches > 0:
+            print(
+                f"Epoch {epoch+1}: Skipped {skipped_batches} batches due to invalid losses."
             )
         
         avg_loss = running_loss / num_batches
