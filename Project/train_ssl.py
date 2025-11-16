@@ -325,6 +325,10 @@ class SSLTrainer:
         )
 
         # Wrap dataset to generate contrastive pairs directly
+        # Track current loader configuration before building DataLoader
+        self.small_batch_mode = False
+        self.current_batch_size = config.batch_size
+
         self.train_dataset = ContrastiveSTL10Dataset(
             base_dataset=base_dataset,
             transform=self.simclr_transform
