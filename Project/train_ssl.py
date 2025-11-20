@@ -807,7 +807,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.03,
+        default=5e-4,
         help="Base learning rate"
     )
     parser.add_argument(
@@ -825,7 +825,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warmup_epochs",
         type=int,
-        default=10,
+        default=15,
         help="Number of warmup epochs"
     )
     

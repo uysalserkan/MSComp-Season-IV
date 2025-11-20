@@ -42,9 +42,9 @@ class SSLConfig:
     
     # Training hyperparameters
     epochs: int = 100
-    learning_rate: float = 0.03  # Base learning rate
+    learning_rate: float = 5e-4  # Base learning rate (lower for AdamW)
     weight_decay: float = 1e-4
-    warmup_epochs: int = 10  # Learning rate warmup
+    warmup_epochs: int = 15  # Learning rate warmup
     
     # Learning rate scheduling
     lr_scheduler: str = "cosine"  # Options: "cosine", "step", None
