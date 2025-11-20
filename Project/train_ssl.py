@@ -459,7 +459,8 @@ class SSLTrainer:
         self,
         loader: torch.utils.data.DataLoader,
         epoch: int,
-        retry: bool = False
+        retry: bool = False,
+        disable_mixed_precision: bool = False
     ) -> Tuple[float, int, int, int]:
         """
         Run a full pass over the provided dataloader.
@@ -490,7 +491,10 @@ class SSLTrainer:
             
             # Forward pass with mixed precision
             try:
-                if self.config.mixed_precision:
+                # Determine if we should use mixed precision for this batch
+                use_mixed_precision = self.config.mixed_precision and not disable_mixed_precision
+                
+                if use_mixed_precision:
                     with autocast():
                         proj1 = self.model(view1)
                         proj2 = self.model(view2)
@@ -520,14 +524,14 @@ class SSLTrainer:
                 continue
             
             # Backward pass
-            if self.config.mixed_precision:
+            if use_mixed_precision:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
             
             # Update weights (with gradient accumulation)
             if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                if self.config.mixed_precision:
+                if use_mixed_precision:
                     if self.config.gradient_clip_norm:
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(
@@ -591,7 +595,8 @@ class SSLTrainer:
                 print(
                     f"\nNo batches processed in epoch {epoch+1}. "
                     f"Retrying with smaller batch size ({self.current_batch_size}) "
-                    "and drop_last=False for stability.\n"
+                    f"Retrying with smaller batch size ({self.current_batch_size}), "
+                    "drop_last=False, and mixed_precision=False for stability.\n"
                 )
                 self.train_loader = self._create_dataloader(
                     batch_size=self.current_batch_size,
@@ -600,7 +605,8 @@ class SSLTrainer:
                 avg_loss, num_batches, _, _ = self._iterate_batches(
                     loader=self.train_loader,
                     epoch=epoch,
-                    retry=True
+                    retry=True,
+                    disable_mixed_precision=True
                 )
 
         if num_batches == 0:
